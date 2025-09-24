@@ -1,6 +1,6 @@
 {
   "node": {
-    "path": "/data/cardano-node/ipc/node.socket",
+    "path": "/ipc/node.socket",
     "magic": 764824073
   },
   "chainSync": {
@@ -17,8 +17,8 @@
       ]
     },
     "disableRollbacksUntil": 122422297,
-    "dbPath": "state"
+    "dbPath": "/data/chain-sync-cache"
   },
   "txTrackerBufferSize": 8192,
-  "indexPath": "data"
+  "indexPath": "/data/utxo-index"
 }

@@ -1,19 +1,15 @@
 services:
   cardano-utxo-monitor:
     container_name: cardano-utxo-monitor
-    build:
-      context: .
-    depends_on:
-      cardano-node:
-        condition: service_healthy
+    build: .
     restart: on-failure
     volumes:
-      - node-ipc:/ipc
+      - cardano-compose-stacks-main_node-ipc:/ipc
       - ./resources:/config
       - utxo-monitor-data:/data
-      - utxo-monitor-logs:/app/logs
+      - ./logs:/app/logs
     ports:
-      - "8091:8091"
+      - "18091:8091"
     command: [
       "--config-path", "/config/conf.json",
       "--log4rs-path", "/config/log4rs.yaml",
@@ -25,9 +21,15 @@ services:
       options:
         max-size: "200k"
         max-file: "10"
+    networks:
+      - cardano_network
 
 volumes:
-  node-ipc:
+  cardano-compose-stacks-main_node-ipc:
     external: true
   utxo-monitor-data:
-  utxo-monitor-logs:
+
+networks:
+  cardano_network:
+    name: cardano-compose-stacks-main_default
+    external: true

@@ -1,0 +1,2 @@
+mkdir -p ./logs
+chmod 777 ./logs
