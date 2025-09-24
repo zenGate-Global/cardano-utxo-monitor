@@ -1,0 +1,13 @@
+[package]
+name = "bloom-derivation"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.84.0"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = "2.0.38"
+quote = "1.0.33"
+derive_utils = "0.13.2"

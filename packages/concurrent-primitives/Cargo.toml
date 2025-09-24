@@ -1,0 +1,14 @@
+[package]
+name = "async-primitives"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.84.0"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+futures = "0.3.25"
+atomic-waker = { git = "https://github.com/oskin1/atomic-waker-broadcast.git", tag = "0.1.0" }
+
+[dev-dependencies]
+tokio = { version = "1.42.0", features = ["full"] }
