@@ -174,6 +174,43 @@ fn credential_from_hash(hash_str: &str) -> Result<Credential, String> {
     }
 }
 
+fn resolve_request_credentials(
+    address: Option<&String>,
+    hash: Option<&String>,
+    mode: AddressQueryMode,
+) -> Result<(Credential, CredentialKind), String> {
+    if let Some(address) = address {
+        let address =
+            Address::from_bech32(address).map_err(|_| "Invalid address format.".to_string())?;
+
+        match mode {
+            AddressQueryMode::ByPaymentCredential => match address.payment_cred() {
+                Some(cred) => Ok((cred.clone(), CredentialKind::Payment)),
+                None => Err("Address does not contain a payment credential.".to_string()),
+            },
+            AddressQueryMode::ByStakingCredential => match &address {
+                Address::Base(base) => Ok((base.stake.clone(), CredentialKind::Stake)),
+                Address::Reward(reward) => Ok((reward.payment.clone(), CredentialKind::Stake)),
+                _ => Err(
+                    "Address does not provide a staking credential for the requested mode."
+                        .to_string(),
+                ),
+            },
+        }
+    } else if let Some(hash) = hash {
+        let credential = credential_from_hash(hash)?;
+
+        let kind = match mode {
+            AddressQueryMode::ByPaymentCredential => CredentialKind::Payment,
+            AddressQueryMode::ByStakingCredential => CredentialKind::Stake,
+        };
+
+        Ok((credential, kind))
+    } else {
+        Err("Either address or hash field is required.".to_string())
+    }
+}
+
 async fn get_utxos<R>(req: web::Json<GetTxOsRequest>, db: Data<R>) -> impl Responder
 where
     R: UtxoResolver + 'static,
@@ -187,49 +224,63 @@ where
         limit,
     } = req.into_inner();
 
-    let (credential, kind) = if let Some(address) = address {
-        let address = match Address::from_bech32(&address) {
-            Ok(addr) => addr,
-            Err(_) => return HttpResponse::BadRequest().body("Invalid address format."),
-        };
-
-        match mode {
-            AddressQueryMode::ByPaymentCredential => match address.payment_cred() {
-                Some(cred) => (cred.clone(), CredentialKind::Payment),
-                None => {
-                    return HttpResponse::BadRequest()
-                        .body("Address does not contain a payment credential.");
-                }
-            },
-            AddressQueryMode::ByStakingCredential => match &address {
-                Address::Base(base) => (base.stake.clone(), CredentialKind::Stake),
-                Address::Reward(reward) => (reward.payment.clone(), CredentialKind::Stake),
-                _ => {
-                    return HttpResponse::BadRequest().body(
-                        "Address does not provide a staking credential for the requested mode.",
-                    );
-                }
-            },
-        }
-    } else if let Some(hash) = hash {
-        let credential = match credential_from_hash(&hash) {
-            Ok(credential) => credential,
+    let (credential, kind) =
+        match resolve_request_credentials(address.as_ref(), hash.as_ref(), mode) {
+            Ok(result) => result,
             Err(err) => return HttpResponse::BadRequest().body(err),
         };
-
-        let kind = match mode {
-            AddressQueryMode::ByPaymentCredential => CredentialKind::Payment,
-            AddressQueryMode::ByStakingCredential => CredentialKind::Stake,
-        };
-
-        (credential, kind)
-    } else {
-        return HttpResponse::BadRequest().body("Either address or hash field is required.");
-    };
 
     let utxos = db.get_utxos(credential, kind, query, offset, limit).await;
     let result = utxos.into_iter().map(UTxO::from).collect::<Vec<_>>();
     HttpResponse::Ok().json(result)
+}
+
+#[derive(Clone, serde::Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTxOsBatchResponseItem {
+    pub request: GetTxOsRequest,
+    pub utxos: Vec<UTxO>,
+    pub error: Option<String>,
+}
+
+async fn get_utxos_batch<R>(req: web::Json<Vec<GetTxOsRequest>>, db: Data<R>) -> impl Responder
+where
+    R: UtxoResolver + 'static,
+{
+    let requests = req.into_inner();
+    let mut responses = Vec::with_capacity(requests.len());
+
+    for request in requests {
+        match resolve_request_credentials(
+            request.address.as_ref(),
+            request.hash.as_ref(),
+            request.mode.clone(),
+        ) {
+            Ok((credential, kind)) => {
+                let utxos = db
+                    .get_utxos(
+                        credential,
+                        kind,
+                        request.query,
+                        request.offset,
+                        request.limit,
+                    )
+                    .await;
+                responses.push(GetTxOsBatchResponseItem {
+                    request,
+                    utxos: utxos.into_iter().map(UTxO::from).collect(),
+                    error: None,
+                });
+            }
+            Err(err) => responses.push(GetTxOsBatchResponseItem {
+                request,
+                utxos: Vec::new(),
+                error: Some(err),
+            }),
+        }
+    }
+
+    HttpResponse::Ok().json(responses)
 }
 
 fn get_utxos_service<R: UtxoResolver + 'static>() -> actix_web::Resource {
@@ -238,6 +289,15 @@ fn get_utxos_service<R: UtxoResolver + 'static>() -> actix_web::Resource {
             .guard(guard::Post())
             .guard(guard::Header("content-type", "application/json"))
             .to(get_utxos::<R>),
+    )
+}
+
+fn get_utxos_batch_service<R: UtxoResolver + 'static>() -> actix_web::Resource {
+    web::resource("/getUtxosBatch").route(
+        web::route()
+            .guard(guard::Post())
+            .guard(guard::Header("content-type", "application/json"))
+            .to(get_utxos_batch::<R>),
     )
 }
 
@@ -273,6 +333,7 @@ where
             .app_data(Data::new(state_synced.clone()))
             .service(healthcheck_service())
             .service(get_utxos_service::<R>())
+            .service(get_utxos_batch_service::<R>())
     })
     .bind(bind_addr)?
     .workers(8)
@@ -312,5 +373,20 @@ mod tests {
         let json = serde_json::to_string_pretty(&sample_request_unspent).unwrap();
         assert!(!json.is_empty());
         println!("{}", json);
+
+        let batch_request = vec![sample_request_all.clone(), sample_request_unspent.clone()];
+        let batch_json = serde_json::to_string_pretty(&batch_request).unwrap();
+        assert!(!batch_json.is_empty());
+        println!("{}", batch_json);
+
+        let response_item = GetTxOsBatchResponseItem {
+            request: sample_request_all,
+            utxos: Vec::new(),
+            error: Some("Some error".into()),
+        };
+
+        let response_json = serde_json::to_string_pretty(&response_item).unwrap();
+        assert!(!response_json.is_empty());
+        println!("{}", response_json);
     }
 }
