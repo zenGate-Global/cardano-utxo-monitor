@@ -5,7 +5,8 @@ use actix_web::web::Data;
 use actix_web::{guard, web, App, HttpResponse, HttpServer, Responder};
 use async_primitives::beacon::Beacon;
 use cml_chain::address::Address;
-use cml_crypto::{RawBytesEncoding, TransactionHash};
+use cml_chain::certs::Credential;
+use cml_crypto::{Ed25519KeyHash, RawBytesEncoding, ScriptHash, TransactionHash};
 use spectrum_cardano_lib::transaction::TransactionOutputExtension;
 use std::io;
 use std::marker::PhantomData;
@@ -22,7 +23,10 @@ pub enum AddressQueryMode {
 #[derive(Clone, serde::Deserialize, serde::Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct GetTxOsRequest {
-    address: String,
+    #[serde(default)]
+    address: Option<String>,
+    #[serde(default)]
+    hash: Option<String>,
     #[serde(default)]
     mode: AddressQueryMode,
     query: TxoQuery,
@@ -83,37 +87,80 @@ pub struct Asset {
 
 pub struct Service<R>(PhantomData<R>);
 
+fn credential_from_hash(hash_str: &str) -> Result<Credential, String> {
+    if let Ok(hash) = Ed25519KeyHash::from_hex(hash_str) {
+        Ok(Credential::PubKey {
+            hash,
+            len_encoding: Default::default(),
+            tag_encoding: None,
+            hash_encoding: Default::default(),
+        })
+    } else if let Ok(hash) = ScriptHash::from_hex(hash_str) {
+        Ok(Credential::Script {
+            hash,
+            len_encoding: Default::default(),
+            tag_encoding: None,
+            hash_encoding: Default::default(),
+        })
+    } else {
+        Err("Invalid key hash format. Expected hex-encoded hash.".to_string())
+    }
+}
+
 async fn get_utxos<R>(req: web::Json<GetTxOsRequest>, db: Data<R>) -> impl Responder
 where
     R: UtxoResolver + 'static,
 {
-    let req = req.into_inner();
-    let address = match Address::from_bech32(&req.address) {
-        Ok(addr) => addr,
-        Err(_) => return HttpResponse::BadRequest().body("Invalid address format."),
+    let GetTxOsRequest {
+        address,
+        hash,
+        mode,
+        query,
+        offset,
+        limit,
+    } = req.into_inner();
+
+    let (credential, kind) = if let Some(address) = address {
+        let address = match Address::from_bech32(&address) {
+            Ok(addr) => addr,
+            Err(_) => return HttpResponse::BadRequest().body("Invalid address format."),
+        };
+
+        match mode {
+            AddressQueryMode::ByPaymentCredential => match address.payment_cred() {
+                Some(cred) => (cred.clone(), CredentialKind::Payment),
+                None => {
+                    return HttpResponse::BadRequest()
+                        .body("Address does not contain a payment credential.");
+                }
+            },
+            AddressQueryMode::ByStakingCredential => match &address {
+                Address::Base(base) => (base.stake.clone(), CredentialKind::Stake),
+                Address::Reward(reward) => (reward.payment.clone(), CredentialKind::Stake),
+                _ => {
+                    return HttpResponse::BadRequest().body(
+                        "Address does not provide a staking credential for the requested mode.",
+                    );
+                }
+            },
+        }
+    } else if let Some(hash) = hash {
+        let credential = match credential_from_hash(&hash) {
+            Ok(credential) => credential,
+            Err(err) => return HttpResponse::BadRequest().body(err),
+        };
+
+        let kind = match mode {
+            AddressQueryMode::ByPaymentCredential => CredentialKind::Payment,
+            AddressQueryMode::ByStakingCredential => CredentialKind::Stake,
+        };
+
+        (credential, kind)
+    } else {
+        return HttpResponse::BadRequest().body("Either address or hash field is required.");
     };
 
-    let (credential, kind) = match req.mode {
-        AddressQueryMode::ByPaymentCredential => match address.payment_cred() {
-            Some(cred) => (cred.clone(), CredentialKind::Payment),
-            None => {
-                return HttpResponse::BadRequest()
-                    .body("Address does not contain a payment credential.");
-            }
-        },
-        AddressQueryMode::ByStakingCredential => match &address {
-            Address::Base(base) => (base.stake.clone(), CredentialKind::Stake),
-            Address::Reward(reward) => (reward.payment.clone(), CredentialKind::Stake),
-            _ => {
-                return HttpResponse::BadRequest()
-                    .body("Address does not provide a staking credential for the requested mode.");
-            }
-        },
-    };
-
-    let utxos = db
-        .get_utxos(credential, kind, req.query, req.offset, req.limit)
-        .await;
+    let utxos = db.get_utxos(credential, kind, query, offset, limit).await;
     let result = utxos.into_iter().map(UTxO::from).collect::<Vec<_>>();
     HttpResponse::Ok().json(result)
 }
@@ -174,7 +221,8 @@ mod tests {
     #[test]
     fn request_samples() {
         let sample_request_all = GetTxOsRequest {
-            address: "addr_test1qpz8h9w8sample000000000000000000000000000000000000".into(),
+            address: Some("addr_test1qpz8h9w8sample000000000000000000000000000000000000".into()),
+            hash: None,
             mode: AddressQueryMode::ByPaymentCredential,
             query: TxoQuery::All(Some(1)),
             offset: 0,
@@ -186,7 +234,8 @@ mod tests {
         println!("{}", json);
 
         let sample_request_unspent = GetTxOsRequest {
-            address: "addr_test1qpz8h9w8sample000000000000000000000000000000000000".into(),
+            address: Some("addr_test1qpz8h9w8sample000000000000000000000000000000000000".into()),
+            hash: None,
             mode: AddressQueryMode::ByStakingCredential,
             query: TxoQuery::Unspent,
             offset: 0,
