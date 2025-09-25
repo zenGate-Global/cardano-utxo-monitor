@@ -34,3 +34,4 @@ rocksdb = "0.22.*"
 rmp-serde = "1.3.0"
 tempfile = "3.10.1"
 hex = "0.4.3"
+cml-core = { git = "https://github.com/oskin1/cardano-multiplatform-lib.git", rev = "13c35772222fc46b26177a62726720502bdf21e4" }

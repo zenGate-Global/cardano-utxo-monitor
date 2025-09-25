@@ -6,6 +6,8 @@ use actix_web::{guard, web, App, HttpResponse, HttpServer, Responder};
 use async_primitives::beacon::Beacon;
 use cml_chain::address::Address;
 use cml_chain::certs::Credential;
+use cml_chain::transaction::{DatumOption, ScriptRef, TransactionOutput};
+use cml_core::serialization::Serialize;
 use cml_crypto::{Ed25519KeyHash, RawBytesEncoding, ScriptHash, TransactionHash};
 use spectrum_cardano_lib::transaction::TransactionOutputExtension;
 use std::io;
@@ -43,10 +45,34 @@ pub struct UTxO {
     pub value: Vec<Asset>,
     pub settled_at: Option<u64>,
     pub spent: bool,
+    pub datum_hash: Option<String>,
+    pub datum: Option<String>,
+    pub script_ref: Option<ScriptRefDto>,
 }
 
 impl From<Txo> for UTxO {
     fn from(txo: Txo) -> Self {
+        let (datum_hash, datum) = txo
+            .output
+            .datum()
+            .map(|datum_option| match datum_option {
+                DatumOption::Hash { datum_hash, .. } => (Some(datum_hash.to_raw_hex()), None),
+                DatumOption::Datum { datum, .. } => {
+                    let datum_hash = datum.hash().to_raw_hex();
+                    let datum = hex::encode(datum.to_cbor_bytes());
+                    (Some(datum_hash), Some(datum))
+                }
+            })
+            .unwrap_or((None, None));
+
+        let script_ref = match &txo.output {
+            TransactionOutput::AlonzoFormatTxOut(_) => None,
+            TransactionOutput::ConwayFormatTxOut(out) => out
+                .script_reference
+                .as_ref()
+                .map(ScriptRefDto::from_script_ref),
+        };
+
         Self {
             transaction_hash: txo.oref.tx_hash(),
             index: txo.oref.index() as usize,
@@ -73,6 +99,9 @@ impl From<Txo> for UTxO {
             .collect(),
             settled_at: txo.settled_at,
             spent: txo.spent,
+            datum_hash,
+            datum,
+            script_ref,
         }
     }
 }
@@ -83,6 +112,44 @@ pub struct Asset {
     pub policy_id: String,
     pub base16_name: String,
     pub amount: String,
+}
+
+#[derive(Clone, serde::Serialize, Debug)]
+pub struct ScriptRefDto {
+    #[serde(rename = "type")]
+    pub script_type: ScriptType,
+    pub script: String,
+}
+
+impl ScriptRefDto {
+    fn from_script_ref(script_ref: &ScriptRef) -> Self {
+        match script_ref {
+            ScriptRef::Native { script, .. } => Self {
+                script_type: ScriptType::Native,
+                script: hex::encode(script.clone().to_cbor_bytes()),
+            },
+            ScriptRef::PlutusV1 { script, .. } => Self {
+                script_type: ScriptType::PlutusV1,
+                script: hex::encode(script.inner.clone()),
+            },
+            ScriptRef::PlutusV2 { script, .. } => Self {
+                script_type: ScriptType::PlutusV2,
+                script: hex::encode(script.inner.clone()),
+            },
+            ScriptRef::PlutusV3 { script, .. } => Self {
+                script_type: ScriptType::PlutusV3,
+                script: hex::encode(script.inner.clone()),
+            },
+        }
+    }
+}
+
+#[derive(Clone, serde::Serialize, Debug)]
+pub enum ScriptType {
+    Native,
+    PlutusV1,
+    PlutusV2,
+    PlutusV3,
 }
 
 pub struct Service<R>(PhantomData<R>);
