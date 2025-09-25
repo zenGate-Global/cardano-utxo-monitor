@@ -24,7 +24,7 @@ pub enum AddressQueryMode {
 
 #[derive(Clone, serde::Deserialize, serde::Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
-pub struct GetTxOsRequest {
+pub struct GetTxOsLookup {
     #[serde(default)]
     address: Option<String>,
     #[serde(default)]
@@ -32,6 +32,13 @@ pub struct GetTxOsRequest {
     #[serde(default)]
     mode: AddressQueryMode,
     query: TxoQuery,
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTxOsRequest {
+    #[serde(flatten)]
+    lookup: GetTxOsLookup,
     offset: usize,
     limit: usize,
 }
@@ -216,21 +223,23 @@ where
     R: UtxoResolver + 'static,
 {
     let GetTxOsRequest {
-        address,
-        hash,
-        mode,
-        query,
+        lookup,
         offset,
         limit,
     } = req.into_inner();
 
-    let (credential, kind) =
-        match resolve_request_credentials(address.as_ref(), hash.as_ref(), mode) {
-            Ok(result) => result,
-            Err(err) => return HttpResponse::BadRequest().body(err),
-        };
+    let (credential, kind) = match resolve_request_credentials(
+        lookup.address.as_ref(),
+        lookup.hash.as_ref(),
+        lookup.mode.clone(),
+    ) {
+        Ok(result) => result,
+        Err(err) => return HttpResponse::BadRequest().body(err),
+    };
 
-    let utxos = db.get_utxos(credential, kind, query, offset, limit).await;
+    let utxos = db
+        .get_utxos(credential, kind, lookup.query, offset, limit)
+        .await;
     let result = utxos.into_iter().map(UTxO::from).collect::<Vec<_>>();
     HttpResponse::Ok().json(result)
 }
@@ -238,16 +247,36 @@ where
 #[derive(Clone, serde::Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct GetTxOsBatchResponseItem {
-    pub request: GetTxOsRequest,
+    pub request: GetTxOsLookup,
     pub utxos: Vec<UTxO>,
     pub error: Option<String>,
 }
 
-async fn get_utxos_batch<R>(req: web::Json<Vec<GetTxOsRequest>>, db: Data<R>) -> impl Responder
+#[derive(Clone, serde::Deserialize, serde::Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTxOsBatchRequest {
+    pub requests: Vec<GetTxOsLookup>,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+#[derive(Clone, serde::Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTxOsBatchResponse {
+    pub offset: usize,
+    pub limit: usize,
+    pub responses: Vec<GetTxOsBatchResponseItem>,
+}
+
+async fn get_utxos_batch<R>(req: web::Json<GetTxOsBatchRequest>, db: Data<R>) -> impl Responder
 where
     R: UtxoResolver + 'static,
 {
-    let requests = req.into_inner();
+    let GetTxOsBatchRequest {
+        requests,
+        offset,
+        limit,
+    } = req.into_inner();
     let mut responses = Vec::with_capacity(requests.len());
 
     for request in requests {
@@ -258,13 +287,7 @@ where
         ) {
             Ok((credential, kind)) => {
                 let utxos = db
-                    .get_utxos(
-                        credential,
-                        kind,
-                        request.query,
-                        request.offset,
-                        request.limit,
-                    )
+                    .get_utxos(credential, kind, request.query, offset, limit)
                     .await;
                 responses.push(GetTxOsBatchResponseItem {
                     request,
@@ -280,7 +303,11 @@ where
         }
     }
 
-    HttpResponse::Ok().json(responses)
+    HttpResponse::Ok().json(GetTxOsBatchResponse {
+        offset,
+        limit,
+        responses,
+    })
 }
 
 fn get_utxos_service<R: UtxoResolver + 'static>() -> actix_web::Resource {
@@ -348,11 +375,15 @@ mod tests {
 
     #[test]
     fn request_samples() {
-        let sample_request_all = GetTxOsRequest {
+        let sample_lookup_all = GetTxOsLookup {
             address: Some("addr_test1qpz8h9w8sample000000000000000000000000000000000000".into()),
             hash: None,
             mode: AddressQueryMode::ByPaymentCredential,
             query: TxoQuery::All(Some(1)),
+        };
+
+        let sample_request_all = GetTxOsRequest {
+            lookup: sample_lookup_all.clone(),
             offset: 0,
             limit: 10,
         };
@@ -361,11 +392,15 @@ mod tests {
         assert!(!json.is_empty());
         println!("{}", json);
 
-        let sample_request_unspent = GetTxOsRequest {
+        let sample_lookup_unspent = GetTxOsLookup {
             address: Some("addr_test1qpz8h9w8sample000000000000000000000000000000000000".into()),
             hash: None,
             mode: AddressQueryMode::ByStakingCredential,
             query: TxoQuery::Unspent,
+        };
+
+        let sample_request_unspent = GetTxOsRequest {
+            lookup: sample_lookup_unspent.clone(),
             offset: 0,
             limit: 10,
         };
@@ -374,15 +409,23 @@ mod tests {
         assert!(!json.is_empty());
         println!("{}", json);
 
-        let batch_request = vec![sample_request_all.clone(), sample_request_unspent.clone()];
+        let batch_request = GetTxOsBatchRequest {
+            requests: vec![sample_lookup_all.clone(), sample_lookup_unspent.clone()],
+            offset: 0,
+            limit: 10,
+        };
         let batch_json = serde_json::to_string_pretty(&batch_request).unwrap();
         assert!(!batch_json.is_empty());
         println!("{}", batch_json);
 
-        let response_item = GetTxOsBatchResponseItem {
-            request: sample_request_all,
-            utxos: Vec::new(),
-            error: Some("Some error".into()),
+        let response_item = GetTxOsBatchResponse {
+            offset: 0,
+            limit: 10,
+            responses: vec![GetTxOsBatchResponseItem {
+                request: sample_lookup_all,
+                utxos: Vec::new(),
+                error: Some("Some error".into()),
+            }],
         };
 
         let response_json = serde_json::to_string_pretty(&response_item).unwrap();

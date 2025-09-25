@@ -100,43 +100,47 @@ curl -X POST http://localhost:8080/getUtxos \
 
 ### POST /getUtxosBatch
 
-Query multiple UTXO options in a single request. Each object in the array accepts the
-same fields as `/getUtxos` (address or hash, query mode, query type, offset, limit).
+Query multiple UTXO options in a single request. Provide the shared pagination values
+once and supply individual lookup parameters for each entry.
 
 **Request Body:**
 ```json
-[
-  {
-    "address": "addr_test1...",
-    "mode": "byPaymentCredential",
-    "query": "Unspent",
-    "offset": 0,
-    "limit": 100
-  },
-  {
-    "hash": "stake_test1...",
-    "mode": "byStakingCredential",
-    "query": {"All": null},
-    "offset": 0,
-    "limit": 50
-  }
-]
+{
+  "requests": [
+    {
+      "address": "addr_test1...",
+      "mode": "byPaymentCredential",
+      "query": "Unspent"
+    },
+    {
+      "hash": "stake_test1...",
+      "mode": "byStakingCredential",
+      "query": {"All": null}
+    }
+  ],
+  "offset": 0,
+  "limit": 50
+}
 ```
 
 **Response:**
 ```json
-[
-  {
-    "request": { "address": "addr_test1...", "mode": "byPaymentCredential", "query": "Unspent", "offset": 0, "limit": 100 },
-    "utxos": [ /* ... */ ],
-    "error": null
-  },
-  {
-    "request": { "hash": "stake_test1...", "mode": "byStakingCredential", "query": {"All": null}, "offset": 0, "limit": 50 },
-    "utxos": [ /* ... */ ],
-    "error": "Optional error message if the request failed"
-  }
-]
+{
+  "offset": 0,
+  "limit": 50,
+  "responses": [
+    {
+      "request": { "address": "addr_test1...", "mode": "byPaymentCredential", "query": "Unspent" },
+      "utxos": [ /* ... */ ],
+      "error": null
+    },
+    {
+      "request": { "hash": "stake_test1...", "mode": "byStakingCredential", "query": {"All": null} },
+      "utxos": [ /* ... */ ],
+      "error": "Optional error message if the request failed"
+    }
+  ]
+}
 ```
 
 ## Development
