@@ -47,9 +47,12 @@ async fn main() {
     log4rs::init_file(args.log4rs_path, Default::default()).unwrap();
 
     let raw_config = std::fs::File::open(args.config_path).expect("Cannot load configuration file");
-    let config: AppConfig = serde_json::from_reader(raw_config).expect("Invalid configuration file");
+    let config: AppConfig =
+        serde_json::from_reader(raw_config).expect("Invalid configuration file");
 
-    let chain_sync_cache = Arc::new(Mutex::new(LedgerCacheRocksDB::new(config.chain_sync.db_path)));
+    let chain_sync_cache = Arc::new(Mutex::new(LedgerCacheRocksDB::new(
+        config.chain_sync.db_path,
+    )));
     let chain_sync = ChainSyncClient::init(
         Arc::clone(&chain_sync_cache),
         config.node.path.clone(),
@@ -118,10 +121,12 @@ async fn main() {
 
     let processes = FuturesUnordered::new();
 
-    let process_ledger_events_stream_handle = tokio::spawn(run_stream(process_ledger_events_stream));
+    let process_ledger_events_stream_handle =
+        tokio::spawn(run_stream(process_ledger_events_stream));
     processes.push(process_ledger_events_stream_handle);
 
-    let process_mempool_events_stream_handle = tokio::spawn(run_stream(process_mempool_events_stream));
+    let process_mempool_events_stream_handle =
+        tokio::spawn(run_stream(process_mempool_events_stream));
     processes.push(process_mempool_events_stream_handle);
 
     let tx_tracker_handle = tokio::spawn(tx_tracker_agent.run());
@@ -165,7 +170,11 @@ struct AppArgs {
 }
 
 fn succinct_tx(tx: &LedgerTxEvent<TxViewMut>) -> (TransactionHash, u64) {
-    let (LedgerTxEvent::TxApplied { tx, block_number, .. }
-    | LedgerTxEvent::TxUnapplied { tx, block_number, .. }) = tx;
+    let (LedgerTxEvent::TxApplied {
+        tx, block_number, ..
+    }
+    | LedgerTxEvent::TxUnapplied {
+        tx, block_number, ..
+    }) = tx;
     (tx.hash, *block_number)
 }
