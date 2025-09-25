@@ -1015,6 +1015,7 @@ dependencies = [
  "cardano-mempool-sync",
  "clap",
  "cml-chain",
+ "cml-core",
  "cml-crypto",
  "derive_more 1.0.0",
  "futures",
