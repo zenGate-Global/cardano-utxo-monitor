@@ -1,20 +1,30 @@
-use crate::index::{Txo, TxoQuery, UtxoResolver};
+use crate::index::{CredentialKind, Txo, TxoQuery, UtxoResolver};
 use actix_cors::Cors;
-use actix_web::dev::{AppService, HttpServiceFactory, Server};
+use actix_web::dev::Server;
 use actix_web::web::Data;
 use actix_web::{guard, web, App, HttpResponse, HttpServer, Responder};
 use async_primitives::beacon::Beacon;
 use cml_chain::address::Address;
-use cml_crypto::{Ed25519KeyHash, RawBytesEncoding, TransactionHash};
+use cml_crypto::{RawBytesEncoding, TransactionHash};
 use spectrum_cardano_lib::transaction::TransactionOutputExtension;
 use std::io;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 
+#[derive(Clone, serde::Deserialize, serde::Serialize, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum AddressQueryMode {
+    #[default]
+    ByPaymentCredential,
+    ByStakingCredential,
+}
+
 #[derive(Clone, serde::Deserialize, serde::Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct GetTxOsRequest {
-    pkh: Ed25519KeyHash,
+    address: String,
+    #[serde(default)]
+    mode: AddressQueryMode,
     query: TxoQuery,
     offset: usize,
     limit: usize,
@@ -43,13 +53,19 @@ impl From<Txo> for UTxO {
                 amount: txo.output.value().coin.to_string(),
             }]
             .into_iter()
-            .chain(txo.output.value().multiasset.iter().flat_map(|(pol, assets)| {
-                assets.iter().map(|(name, amt)| Asset {
-                    policy_id: pol.to_string(),
-                    base16_name: name.to_raw_hex(),
-                    amount: amt.to_string(),
-                })
-            }))
+            .chain(
+                txo.output
+                    .value()
+                    .multiasset
+                    .iter()
+                    .flat_map(|(pol, assets)| {
+                        assets.iter().map(|(name, amt)| Asset {
+                            policy_id: pol.to_string(),
+                            base16_name: name.to_raw_hex(),
+                            amount: amt.to_string(),
+                        })
+                    }),
+            )
             .collect(),
             settled_at: txo.settled_at,
             spent: txo.spent,
@@ -71,7 +87,33 @@ async fn get_utxos<R>(req: web::Json<GetTxOsRequest>, db: Data<R>) -> impl Respo
 where
     R: UtxoResolver + 'static,
 {
-    let utxos = db.get_utxos(req.pkh, req.query, req.offset, req.limit).await;
+    let req = req.into_inner();
+    let address = match Address::from_bech32(&req.address) {
+        Ok(addr) => addr,
+        Err(_) => return HttpResponse::BadRequest().body("Invalid address format."),
+    };
+
+    let (credential, kind) = match req.mode {
+        AddressQueryMode::ByPaymentCredential => match address.payment_cred() {
+            Some(cred) => (cred.clone(), CredentialKind::Payment),
+            None => {
+                return HttpResponse::BadRequest()
+                    .body("Address does not contain a payment credential.");
+            }
+        },
+        AddressQueryMode::ByStakingCredential => match &address {
+            Address::Base(base) => (base.stake.clone(), CredentialKind::Stake),
+            Address::Reward(reward) => (reward.payment.clone(), CredentialKind::Stake),
+            _ => {
+                return HttpResponse::BadRequest()
+                    .body("Address does not provide a staking credential for the requested mode.");
+            }
+        },
+    };
+
+    let utxos = db
+        .get_utxos(credential, kind, req.query, req.offset, req.limit)
+        .await;
     let result = utxos.into_iter().map(UTxO::from).collect::<Vec<_>>();
     HttpResponse::Ok().json(result)
 }
@@ -132,7 +174,8 @@ mod tests {
     #[test]
     fn request_samples() {
         let sample_request_all = GetTxOsRequest {
-            pkh: Ed25519KeyHash::from([0u8; 28]),
+            address: "addr_test1qpz8h9w8sample000000000000000000000000000000000000".into(),
+            mode: AddressQueryMode::ByPaymentCredential,
             query: TxoQuery::All(Some(1)),
             offset: 0,
             limit: 10,
@@ -143,7 +186,8 @@ mod tests {
         println!("{}", json);
 
         let sample_request_unspent = GetTxOsRequest {
-            pkh: Ed25519KeyHash::from([0u8; 28]),
+            address: "addr_test1qpz8h9w8sample000000000000000000000000000000000000".into(),
+            mode: AddressQueryMode::ByStakingCredential,
             query: TxoQuery::Unspent,
             offset: 0,
             limit: 10,
