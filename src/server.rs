@@ -24,7 +24,7 @@ pub enum AddressQueryMode {
 
 #[derive(Clone, serde::Deserialize, serde::Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
-pub struct GetTxOsRequest {
+pub struct GetTxOsLookup {
     #[serde(default)]
     address: Option<String>,
     #[serde(default)]
@@ -32,6 +32,13 @@ pub struct GetTxOsRequest {
     #[serde(default)]
     mode: AddressQueryMode,
     query: TxoQuery,
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTxOsRequest {
+    #[serde(flatten)]
+    lookup: GetTxOsLookup,
     offset: usize,
     limit: usize,
 }
@@ -174,62 +181,133 @@ fn credential_from_hash(hash_str: &str) -> Result<Credential, String> {
     }
 }
 
-async fn get_utxos<R>(req: web::Json<GetTxOsRequest>, db: Data<R>) -> impl Responder
-where
-    R: UtxoResolver + 'static,
-{
-    let GetTxOsRequest {
-        address,
-        hash,
-        mode,
-        query,
-        offset,
-        limit,
-    } = req.into_inner();
-
-    let (credential, kind) = if let Some(address) = address {
-        let address = match Address::from_bech32(&address) {
-            Ok(addr) => addr,
-            Err(_) => return HttpResponse::BadRequest().body("Invalid address format."),
-        };
+fn resolve_request_credentials(
+    address: Option<&String>,
+    hash: Option<&String>,
+    mode: AddressQueryMode,
+) -> Result<(Credential, CredentialKind), String> {
+    if let Some(address) = address {
+        let address =
+            Address::from_bech32(address).map_err(|_| "Invalid address format.".to_string())?;
 
         match mode {
             AddressQueryMode::ByPaymentCredential => match address.payment_cred() {
-                Some(cred) => (cred.clone(), CredentialKind::Payment),
-                None => {
-                    return HttpResponse::BadRequest()
-                        .body("Address does not contain a payment credential.");
-                }
+                Some(cred) => Ok((cred.clone(), CredentialKind::Payment)),
+                None => Err("Address does not contain a payment credential.".to_string()),
             },
             AddressQueryMode::ByStakingCredential => match &address {
-                Address::Base(base) => (base.stake.clone(), CredentialKind::Stake),
-                Address::Reward(reward) => (reward.payment.clone(), CredentialKind::Stake),
-                _ => {
-                    return HttpResponse::BadRequest().body(
-                        "Address does not provide a staking credential for the requested mode.",
-                    );
-                }
+                Address::Base(base) => Ok((base.stake.clone(), CredentialKind::Stake)),
+                Address::Reward(reward) => Ok((reward.payment.clone(), CredentialKind::Stake)),
+                _ => Err(
+                    "Address does not provide a staking credential for the requested mode."
+                        .to_string(),
+                ),
             },
         }
     } else if let Some(hash) = hash {
-        let credential = match credential_from_hash(&hash) {
-            Ok(credential) => credential,
-            Err(err) => return HttpResponse::BadRequest().body(err),
-        };
+        let credential = credential_from_hash(hash)?;
 
         let kind = match mode {
             AddressQueryMode::ByPaymentCredential => CredentialKind::Payment,
             AddressQueryMode::ByStakingCredential => CredentialKind::Stake,
         };
 
-        (credential, kind)
+        Ok((credential, kind))
     } else {
-        return HttpResponse::BadRequest().body("Either address or hash field is required.");
+        Err("Either address or hash field is required.".to_string())
+    }
+}
+
+async fn get_utxos<R>(req: web::Json<GetTxOsRequest>, db: Data<R>) -> impl Responder
+where
+    R: UtxoResolver + 'static,
+{
+    let GetTxOsRequest {
+        lookup,
+        offset,
+        limit,
+    } = req.into_inner();
+
+    let (credential, kind) = match resolve_request_credentials(
+        lookup.address.as_ref(),
+        lookup.hash.as_ref(),
+        lookup.mode.clone(),
+    ) {
+        Ok(result) => result,
+        Err(err) => return HttpResponse::BadRequest().body(err),
     };
 
-    let utxos = db.get_utxos(credential, kind, query, offset, limit).await;
+    let utxos = db
+        .get_utxos(credential, kind, lookup.query, offset, limit)
+        .await;
     let result = utxos.into_iter().map(UTxO::from).collect::<Vec<_>>();
     HttpResponse::Ok().json(result)
+}
+
+#[derive(Clone, serde::Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTxOsBatchResponseItem {
+    pub request: GetTxOsLookup,
+    pub utxos: Vec<UTxO>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTxOsBatchRequest {
+    pub requests: Vec<GetTxOsLookup>,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+#[derive(Clone, serde::Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTxOsBatchResponse {
+    pub offset: usize,
+    pub limit: usize,
+    pub responses: Vec<GetTxOsBatchResponseItem>,
+}
+
+async fn get_utxos_batch<R>(req: web::Json<GetTxOsBatchRequest>, db: Data<R>) -> impl Responder
+where
+    R: UtxoResolver + 'static,
+{
+    let GetTxOsBatchRequest {
+        requests,
+        offset,
+        limit,
+    } = req.into_inner();
+    let mut responses = Vec::with_capacity(requests.len());
+
+    for request in requests {
+        match resolve_request_credentials(
+            request.address.as_ref(),
+            request.hash.as_ref(),
+            request.mode.clone(),
+        ) {
+            Ok((credential, kind)) => {
+                let utxos = db
+                    .get_utxos(credential, kind, request.query, offset, limit)
+                    .await;
+                responses.push(GetTxOsBatchResponseItem {
+                    request,
+                    utxos: utxos.into_iter().map(UTxO::from).collect(),
+                    error: None,
+                });
+            }
+            Err(err) => responses.push(GetTxOsBatchResponseItem {
+                request,
+                utxos: Vec::new(),
+                error: Some(err),
+            }),
+        }
+    }
+
+    HttpResponse::Ok().json(GetTxOsBatchResponse {
+        offset,
+        limit,
+        responses,
+    })
 }
 
 fn get_utxos_service<R: UtxoResolver + 'static>() -> actix_web::Resource {
@@ -238,6 +316,15 @@ fn get_utxos_service<R: UtxoResolver + 'static>() -> actix_web::Resource {
             .guard(guard::Post())
             .guard(guard::Header("content-type", "application/json"))
             .to(get_utxos::<R>),
+    )
+}
+
+fn get_utxos_batch_service<R: UtxoResolver + 'static>() -> actix_web::Resource {
+    web::resource("/getUtxosBatch").route(
+        web::route()
+            .guard(guard::Post())
+            .guard(guard::Header("content-type", "application/json"))
+            .to(get_utxos_batch::<R>),
     )
 }
 
@@ -273,6 +360,7 @@ where
             .app_data(Data::new(state_synced.clone()))
             .service(healthcheck_service())
             .service(get_utxos_service::<R>())
+            .service(get_utxos_batch_service::<R>())
     })
     .bind(bind_addr)?
     .workers(8)
@@ -287,11 +375,15 @@ mod tests {
 
     #[test]
     fn request_samples() {
-        let sample_request_all = GetTxOsRequest {
+        let sample_lookup_all = GetTxOsLookup {
             address: Some("addr_test1qpz8h9w8sample000000000000000000000000000000000000".into()),
             hash: None,
             mode: AddressQueryMode::ByPaymentCredential,
             query: TxoQuery::All(Some(1)),
+        };
+
+        let sample_request_all = GetTxOsRequest {
+            lookup: sample_lookup_all.clone(),
             offset: 0,
             limit: 10,
         };
@@ -300,11 +392,15 @@ mod tests {
         assert!(!json.is_empty());
         println!("{}", json);
 
-        let sample_request_unspent = GetTxOsRequest {
+        let sample_lookup_unspent = GetTxOsLookup {
             address: Some("addr_test1qpz8h9w8sample000000000000000000000000000000000000".into()),
             hash: None,
             mode: AddressQueryMode::ByStakingCredential,
             query: TxoQuery::Unspent,
+        };
+
+        let sample_request_unspent = GetTxOsRequest {
+            lookup: sample_lookup_unspent.clone(),
             offset: 0,
             limit: 10,
         };
@@ -312,5 +408,28 @@ mod tests {
         let json = serde_json::to_string_pretty(&sample_request_unspent).unwrap();
         assert!(!json.is_empty());
         println!("{}", json);
+
+        let batch_request = GetTxOsBatchRequest {
+            requests: vec![sample_lookup_all.clone(), sample_lookup_unspent.clone()],
+            offset: 0,
+            limit: 10,
+        };
+        let batch_json = serde_json::to_string_pretty(&batch_request).unwrap();
+        assert!(!batch_json.is_empty());
+        println!("{}", batch_json);
+
+        let response_item = GetTxOsBatchResponse {
+            offset: 0,
+            limit: 10,
+            responses: vec![GetTxOsBatchResponseItem {
+                request: sample_lookup_all,
+                utxos: Vec::new(),
+                error: Some("Some error".into()),
+            }],
+        };
+
+        let response_json = serde_json::to_string_pretty(&response_item).unwrap();
+        assert!(!response_json.is_empty());
+        println!("{}", response_json);
     }
 }

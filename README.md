@@ -98,6 +98,51 @@ curl -X POST http://localhost:8080/getUtxos \
   -d '{"pkh": "your_pkh", "query": {"All": null}, "offset": 0, "limit": 100}'
 ```
 
+### POST /getUtxosBatch
+
+Query multiple UTXO options in a single request. Provide the shared pagination values
+once and supply individual lookup parameters for each entry.
+
+**Request Body:**
+```json
+{
+  "requests": [
+    {
+      "address": "addr_test1...",
+      "mode": "byPaymentCredential",
+      "query": "Unspent"
+    },
+    {
+      "hash": "stake_test1...",
+      "mode": "byStakingCredential",
+      "query": {"All": null}
+    }
+  ],
+  "offset": 0,
+  "limit": 50
+}
+```
+
+**Response:**
+```json
+{
+  "offset": 0,
+  "limit": 50,
+  "responses": [
+    {
+      "request": { "address": "addr_test1...", "mode": "byPaymentCredential", "query": "Unspent" },
+      "utxos": [ /* ... */ ],
+      "error": null
+    },
+    {
+      "request": { "hash": "stake_test1...", "mode": "byStakingCredential", "query": {"All": null} },
+      "utxos": [ /* ... */ ],
+      "error": "Optional error message if the request failed"
+    }
+  ]
+}
+```
+
 ## Development
 
 Install rust and cargo
