@@ -286,9 +286,8 @@ where
             request.mode.clone(),
         ) {
             Ok((credential, kind)) => {
-                let utxos = db
-                    .get_utxos(credential, kind, request.query, offset, limit)
-                    .await;
+                let query = request.query.clone();
+                let utxos = db.get_utxos(credential, kind, query, offset, limit).await;
                 responses.push(GetTxOsBatchResponseItem {
                     request,
                     utxos: utxos.into_iter().map(UTxO::from).collect(),
@@ -409,8 +408,31 @@ mod tests {
         assert!(!json.is_empty());
         println!("{}", json);
 
+        let sample_lookup_unspent_by_unit = GetTxOsLookup {
+            address: Some("addr_test1qpz8h9w8sample000000000000000000000000000000000000".into()),
+            hash: None,
+            mode: AddressQueryMode::ByPaymentCredential,
+            query: TxoQuery::UnspentByUnit(
+                "policyid000000000000000000000000000000000000000000asset".into(),
+            ),
+        };
+
+        let sample_request_unspent_by_unit = GetTxOsRequest {
+            lookup: sample_lookup_unspent_by_unit.clone(),
+            offset: 0,
+            limit: 10,
+        };
+
+        let json = serde_json::to_string_pretty(&sample_request_unspent_by_unit).unwrap();
+        assert!(!json.is_empty());
+        println!("{}", json);
+
         let batch_request = GetTxOsBatchRequest {
-            requests: vec![sample_lookup_all.clone(), sample_lookup_unspent.clone()],
+            requests: vec![
+                sample_lookup_all.clone(),
+                sample_lookup_unspent.clone(),
+                sample_lookup_unspent_by_unit.clone(),
+            ],
             offset: 0,
             limit: 10,
         };

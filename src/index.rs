@@ -9,6 +9,7 @@ use rocksdb::{
     ColumnFamily, DBIteratorWithThreadMode, Direction, IteratorMode, Options, ReadOptions,
     SnapshotWithThreadMode, Transaction, TransactionDB, TransactionDBOptions,
 };
+use spectrum_cardano_lib::transaction::TransactionOutputExtension;
 use spectrum_cardano_lib::OutputRef;
 use spectrum_offchain::display::{display_option, display_vec};
 use spectrum_offchain::tracing::Tracing;
@@ -96,10 +97,11 @@ pub trait UtxoResolver {
     ) -> Vec<Txo>;
 }
 
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum TxoQuery {
     All(Option<Slot>),
     Unspent,
+    UnspentByUnit(String),
 }
 
 #[derive(Clone)]
@@ -415,16 +417,22 @@ impl UtxoResolver for RocksDB {
             let (events_cf, unspent_cf) = cols.index_cfs(kind);
             let prefix = credential_key_prefix(&credential);
             let prefix_len = prefix.len();
-            let (num_key_bytes_to_drop, index_cf, lower_bound) = match query {
-                TxoQuery::All(least_slot) => {
-                    (prefix_len + 8, events_cf, Some(settled_at_key(least_slot)))
-                }
-                TxoQuery::Unspent => (prefix_len, unspent_cf, None),
+            if limit == 0 {
+                return Vec::new();
+            }
+            let (num_key_bytes_to_drop, index_cf, lower_bound, unit_filter) = match query {
+                TxoQuery::All(least_slot) => (
+                    prefix_len + 8,
+                    events_cf,
+                    Some(settled_at_key(least_slot)),
+                    None,
+                ),
+                TxoQuery::Unspent => (prefix_len, unspent_cf, None, None),
+                TxoQuery::UnspentByUnit(unit) => (prefix_len, unspent_cf, None, Some(unit)),
             };
-            let mut txo_iter = get_range_iterator(&snap, index_cf, prefix.clone(), lower_bound)
-                .skip(offset)
-                .take(limit);
+            let mut txo_iter = get_range_iterator(&snap, index_cf, prefix.clone(), lower_bound);
             let mut txo_set = vec![];
+            let mut matched = 0usize;
             while let Some(Ok((index, _))) = txo_iter.next() {
                 let utxo_key = &index[num_key_bytes_to_drop..];
                 if let Some((output, confirmed_at, spent)) = snap
@@ -440,12 +448,25 @@ impl UtxoResolver for RocksDB {
                     })
                 {
                     let oref = rmp_serde::from_slice::<OutputRef>(utxo_key).unwrap();
+                    if let Some(unit) = &unit_filter {
+                        if !output_contains_unit(&output, unit) {
+                            continue;
+                        }
+                    }
+                    if matched < offset {
+                        matched += 1;
+                        continue;
+                    }
                     txo_set.push(Txo {
                         oref,
                         output,
                         settled_at: confirmed_at,
                         spent,
                     });
+                    matched += 1;
+                    if txo_set.len() >= limit {
+                        break;
+                    }
                 }
             }
             txo_set
@@ -453,6 +474,25 @@ impl UtxoResolver for RocksDB {
         .await
         .unwrap()
     }
+}
+
+fn output_contains_unit(output: &TransactionOutput, unit: &str) -> bool {
+    output
+        .value()
+        .multiasset
+        .iter()
+        .flat_map(|(policy_id, assets)| {
+            let policy_hex = policy_id.to_string();
+            assets
+                .iter()
+                .map(move |(asset_name, _)| (policy_hex.clone(), asset_name.to_raw_hex()))
+        })
+        .any(|(policy_hex, asset_hex)| {
+            let mut combined = String::with_capacity(policy_hex.len() + asset_hex.len());
+            combined.push_str(&policy_hex);
+            combined.push_str(&asset_hex);
+            combined.eq_ignore_ascii_case(unit)
+        })
 }
 
 pub(crate) fn get_range_iterator<'a: 'b, 'b>(
@@ -482,7 +522,9 @@ mod tests {
     use cml_chain::transaction::Transaction;
     use cml_chain::{Deserialize, Slot};
     use cml_crypto::Ed25519KeyHash;
+    use cml_crypto::RawBytesEncoding;
     use rocksdb::{Options, SingleThreaded, TransactionDB};
+    use spectrum_cardano_lib::transaction::TransactionOutputExtension;
     use spectrum_cardano_lib::OutputRef;
     use spectrum_offchain::tx_hash::CanonicalHash;
     use std::path::{Path, PathBuf};
@@ -654,6 +696,48 @@ mod tests {
                 .len(),
             tail_txos.len()
         );
+    }
+
+    #[tokio::test]
+    async fn index_filters_unspent_by_unit() {
+        let txs = vec![(TX_PRODUCE, Some(1))];
+        let credential_hex = "bed3c3bac9ddc7952cc91cf76db3dd808f99f4a0dd07e78e06657bc2";
+
+        let all_txos = test_utxo_resolving(
+            txs.clone(),
+            credential_hex,
+            CredentialKind::Payment,
+            TxoQuery::All(Some(0)),
+        )
+        .await;
+
+        let unit = all_txos
+            .iter()
+            .find_map(|txo| {
+                for (policy_id, assets) in txo.output.value().multiasset.iter() {
+                    let policy_hex = policy_id.to_string();
+                    for (asset_name, _) in assets.iter() {
+                        let mut unit = policy_hex.clone();
+                        unit.push_str(&asset_name.to_raw_hex());
+                        return Some(unit);
+                    }
+                }
+                None
+            })
+            .expect("expected multi-asset utxo");
+
+        let filtered = test_utxo_resolving(
+            txs,
+            credential_hex,
+            CredentialKind::Payment,
+            TxoQuery::UnspentByUnit(unit.clone()),
+        )
+        .await;
+
+        assert!(filtered
+            .iter()
+            .all(|txo| super::output_contains_unit(&txo.output, &unit)));
+        assert!(!filtered.is_empty());
     }
 
     async fn test_utxo_resolving(
