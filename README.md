@@ -81,7 +81,9 @@ Query UTXOs for a specific public key hash.
 | `"Unspent"` | Get spendable UTXOs (most common) | `"Unspent"` |
 | `{"All": null}` | Get all UTXOs since service start | `{"All": null}` |
 | `{"All": 123456}` | Get all UTXOs from specific slot | `{"All": 123456}` |
-| `{"unspentByUnit": "<policy_id><asset_name>"}` | Get spendable UTXOs that contain a specific asset unit | `{"unspentByUnit": "<policy_id><asset_name>"}` |
+| `{"unspentByUnit": "<policy_id><asset_name>"}` | Get spendable UTXOs that contain a specific asset unit (optionally scoped by address or hash) | `{"unspentByUnit": "<policy_id><asset_name>"}` |
+
+When `address`/`hash` are omitted in combination with `unspentByUnit`, the monitor scans all stored unspent outputs and returns only those containing the requested asset unit.
 
 **Examples:**
 
@@ -92,11 +94,18 @@ curl -X POST http://localhost:8080/getUtxos \
   -d '{"pkh": "your_pkh", "query": "Unspent", "offset": 0, "limit": 100}'
 ```
 
-Get unspent UTXOs containing a specific unit:
+Get unspent UTXOs containing a specific unit scoped to a payment credential:
 ```bash
 curl -X POST http://localhost:8080/getUtxos \
   -H "Content-Type: application/json" \
   -d '{"pkh": "your_pkh", "query": {"unspentByUnit": "policyidassetname"}, "offset": 0, "limit": 100}'
+```
+
+Get unspent UTXOs containing a specific unit across all known credentials:
+```bash
+curl -X POST http://localhost:8080/getUtxos \
+  -H "Content-Type: application/json" \
+  -d '{"query": {"unspentByUnit": "policyidassetname"}, "offset": 0, "limit": 100}'
 ```
 
 Get transaction history:
@@ -128,6 +137,9 @@ once and supply individual lookup parameters for each entry.
     {
       "address": "addr_test1...",
       "mode": "byPaymentCredential",
+      "query": {"unspentByUnit": "policyidassetname"}
+    },
+    {
       "query": {"unspentByUnit": "policyidassetname"}
     }
   ],

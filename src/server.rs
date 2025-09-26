@@ -185,19 +185,22 @@ fn resolve_request_credentials(
     address: Option<&String>,
     hash: Option<&String>,
     mode: AddressQueryMode,
-) -> Result<(Credential, CredentialKind), String> {
+    query: &TxoQuery,
+) -> Result<Option<(Credential, CredentialKind)>, String> {
     if let Some(address) = address {
         let address =
             Address::from_bech32(address).map_err(|_| "Invalid address format.".to_string())?;
 
         match mode {
             AddressQueryMode::ByPaymentCredential => match address.payment_cred() {
-                Some(cred) => Ok((cred.clone(), CredentialKind::Payment)),
+                Some(cred) => Ok(Some((cred.clone(), CredentialKind::Payment))),
                 None => Err("Address does not contain a payment credential.".to_string()),
             },
             AddressQueryMode::ByStakingCredential => match &address {
-                Address::Base(base) => Ok((base.stake.clone(), CredentialKind::Stake)),
-                Address::Reward(reward) => Ok((reward.payment.clone(), CredentialKind::Stake)),
+                Address::Base(base) => Ok(Some((base.stake.clone(), CredentialKind::Stake))),
+                Address::Reward(reward) => {
+                    Ok(Some((reward.payment.clone(), CredentialKind::Stake)))
+                }
                 _ => Err(
                     "Address does not provide a staking credential for the requested mode."
                         .to_string(),
@@ -212,9 +215,12 @@ fn resolve_request_credentials(
             AddressQueryMode::ByStakingCredential => CredentialKind::Stake,
         };
 
-        Ok((credential, kind))
+        Ok(Some((credential, kind)))
     } else {
-        Err("Either address or hash field is required.".to_string())
+        match query {
+            TxoQuery::UnspentByUnit(_) => Ok(None),
+            _ => Err("Either address or hash field is required unless querying unspentByUnit without a credential.".to_string()),
+        }
     }
 }
 
@@ -228,18 +234,19 @@ where
         limit,
     } = req.into_inner();
 
-    let (credential, kind) = match resolve_request_credentials(
+    let query = lookup.query.clone();
+
+    let scope = match resolve_request_credentials(
         lookup.address.as_ref(),
         lookup.hash.as_ref(),
-        lookup.mode.clone(),
+        lookup.mode,
+        &query,
     ) {
         Ok(result) => result,
         Err(err) => return HttpResponse::BadRequest().body(err),
     };
 
-    let utxos = db
-        .get_utxos(credential, kind, lookup.query, offset, limit)
-        .await;
+    let utxos = db.get_utxos(scope, query, offset, limit).await;
     let result = utxos.into_iter().map(UTxO::from).collect::<Vec<_>>();
     HttpResponse::Ok().json(result)
 }
@@ -284,10 +291,11 @@ where
             request.address.as_ref(),
             request.hash.as_ref(),
             request.mode.clone(),
+            &request.query,
         ) {
-            Ok((credential, kind)) => {
+            Ok(scope) => {
                 let query = request.query.clone();
-                let utxos = db.get_utxos(credential, kind, query, offset, limit).await;
+                let utxos = db.get_utxos(scope, query, offset, limit).await;
                 responses.push(GetTxOsBatchResponseItem {
                     request,
                     utxos: utxos.into_iter().map(UTxO::from).collect(),
@@ -417,6 +425,15 @@ mod tests {
             ),
         };
 
+        let sample_lookup_unspent_by_unit_global = GetTxOsLookup {
+            address: None,
+            hash: None,
+            mode: AddressQueryMode::ByPaymentCredential,
+            query: TxoQuery::UnspentByUnit(
+                "policyid000000000000000000000000000000000000000000asset".into(),
+            ),
+        };
+
         let sample_request_unspent_by_unit = GetTxOsRequest {
             lookup: sample_lookup_unspent_by_unit.clone(),
             offset: 0,
@@ -432,6 +449,7 @@ mod tests {
                 sample_lookup_all.clone(),
                 sample_lookup_unspent.clone(),
                 sample_lookup_unspent_by_unit.clone(),
+                sample_lookup_unspent_by_unit_global.clone(),
             ],
             offset: 0,
             limit: 10,

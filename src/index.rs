@@ -89,8 +89,7 @@ pub enum CredentialKind {
 pub trait UtxoResolver {
     async fn get_utxos(
         &self,
-        credential: Credential,
-        kind: CredentialKind,
+        scope: Option<(Credential, CredentialKind)>,
         query: TxoQuery,
         offset: usize,
         limit: usize,
@@ -404,72 +403,123 @@ impl UtxoIndex for RocksDB {
 impl UtxoResolver for RocksDB {
     async fn get_utxos(
         &self,
-        credential: Credential,
-        kind: CredentialKind,
+        scope: Option<(Credential, CredentialKind)>,
         query: TxoQuery,
         offset: usize,
         limit: usize,
     ) -> Vec<Txo> {
         let db = self.db.clone();
         spawn_blocking(move || {
-            let cols = get_columns(&db);
-            let snap = db.snapshot();
-            let (events_cf, unspent_cf) = cols.index_cfs(kind);
-            let prefix = credential_key_prefix(&credential);
-            let prefix_len = prefix.len();
             if limit == 0 {
                 return Vec::new();
             }
-            let (num_key_bytes_to_drop, index_cf, lower_bound, unit_filter) = match query {
-                TxoQuery::All(least_slot) => (
-                    prefix_len + 8,
-                    events_cf,
-                    Some(settled_at_key(least_slot)),
-                    None,
-                ),
-                TxoQuery::Unspent => (prefix_len, unspent_cf, None, None),
-                TxoQuery::UnspentByUnit(unit) => (prefix_len, unspent_cf, None, Some(unit)),
-            };
-            let mut txo_iter = get_range_iterator(&snap, index_cf, prefix.clone(), lower_bound);
-            let mut txo_set = vec![];
-            let mut matched = 0usize;
-            while let Some(Ok((index, _))) = txo_iter.next() {
-                let utxo_key = &index[num_key_bytes_to_drop..];
-                if let Some((output, confirmed_at, spent)) = snap
-                    .get_cf(cols.txo_cf, utxo_key)
-                    .unwrap()
-                    .and_then(|bytes| {
-                        rmp_serde::from_slice::<(Vec<u8>, Option<Slot>, bool)>(&bytes).ok()
-                    })
-                    .and_then(|(utxo_bytes, settled_at, spent)| {
-                        TransactionOutput::from_cbor_bytes(&utxo_bytes)
-                            .ok()
-                            .map(|o| (o, settled_at, spent))
-                    })
-                {
-                    let oref = rmp_serde::from_slice::<OutputRef>(utxo_key).unwrap();
-                    if let Some(unit) = &unit_filter {
-                        if !output_contains_unit(&output, unit) {
-                            continue;
+
+            let cols = get_columns(&db);
+            let snap = db.snapshot();
+
+            match (scope, query) {
+                (Some((credential, kind)), query_variant) => {
+                    let (events_cf, unspent_cf) = cols.index_cfs(kind);
+                    let prefix = credential_key_prefix(&credential);
+                    let prefix_len = prefix.len();
+                    let (num_key_bytes_to_drop, index_cf, lower_bound, unit_filter) =
+                        match query_variant {
+                            TxoQuery::All(least_slot) => (
+                                prefix_len + 8,
+                                events_cf,
+                                Some(settled_at_key(least_slot)),
+                                None,
+                            ),
+                            TxoQuery::Unspent => (prefix_len, unspent_cf, None, None),
+                            TxoQuery::UnspentByUnit(unit) => {
+                                (prefix_len, unspent_cf, None, Some(unit))
+                            }
+                        };
+                    let mut txo_iter =
+                        get_range_iterator(&snap, index_cf, prefix.clone(), lower_bound);
+                    let mut txo_set = vec![];
+                    let mut matched = 0usize;
+                    while let Some(Ok((index, _))) = txo_iter.next() {
+                        let utxo_key = &index[num_key_bytes_to_drop..];
+                        if let Some((output, confirmed_at, spent)) = snap
+                            .get_cf(cols.txo_cf, utxo_key)
+                            .unwrap()
+                            .and_then(|bytes| {
+                                rmp_serde::from_slice::<(Vec<u8>, Option<Slot>, bool)>(&bytes).ok()
+                            })
+                            .and_then(|(utxo_bytes, settled_at, spent)| {
+                                TransactionOutput::from_cbor_bytes(&utxo_bytes)
+                                    .ok()
+                                    .map(|o| (o, settled_at, spent))
+                            })
+                        {
+                            let oref = rmp_serde::from_slice::<OutputRef>(utxo_key).unwrap();
+                            if let Some(unit) = &unit_filter {
+                                if !output_contains_unit(&output, unit) {
+                                    continue;
+                                }
+                            }
+                            if matched < offset {
+                                matched += 1;
+                                continue;
+                            }
+                            txo_set.push(Txo {
+                                oref,
+                                output,
+                                settled_at: confirmed_at,
+                                spent,
+                            });
+                            matched += 1;
+                            if txo_set.len() >= limit {
+                                break;
+                            }
                         }
                     }
-                    if matched < offset {
-                        matched += 1;
-                        continue;
-                    }
-                    txo_set.push(Txo {
-                        oref,
-                        output,
-                        settled_at: confirmed_at,
-                        spent,
-                    });
-                    matched += 1;
-                    if txo_set.len() >= limit {
-                        break;
-                    }
+                    txo_set
                 }
+                (None, TxoQuery::UnspentByUnit(unit)) => {
+                    let mut txo_iter = snap.iterator_cf(cols.txo_cf, IteratorMode::Start);
+                    let mut txo_set = Vec::new();
+                    let mut matched = 0usize;
+
+                    while let Some(Ok((key, bytes))) = txo_iter.next() {
+                        if let Ok((utxo_bytes, settled_at, spent)) =
+                            rmp_serde::from_slice::<(Vec<u8>, Option<Slot>, bool)>(&bytes)
+                        {
+                            if spent {
+                                continue;
+                            }
+
+                            if let Ok(output) = TransactionOutput::from_cbor_bytes(&utxo_bytes) {
+                                if !output_contains_unit(&output, &unit) {
+                                    continue;
+                                }
+
+                                if matched < offset {
+                                    matched += 1;
+                                    continue;
+                                }
+
+                                let oref = rmp_serde::from_slice::<OutputRef>(&key).unwrap();
+                                txo_set.push(Txo {
+                                    oref,
+                                    output,
+                                    settled_at,
+                                    spent,
+                                });
+                                matched += 1;
+
+                                if txo_set.len() >= limit {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    txo_set
+                }
+                (None, _) => Vec::new(),
             }
-            txo_set
         })
         .await
         .unwrap()
@@ -635,8 +685,7 @@ mod tests {
         let expected_oref = expected_oref.expect("expected oref");
         let stake_utxos = db
             .get_utxos(
-                stake_credential.clone(),
-                CredentialKind::Stake,
+                Some((stake_credential.clone(), CredentialKind::Stake)),
                 TxoQuery::All(Some(0)),
                 0,
                 100,
@@ -647,8 +696,7 @@ mod tests {
         if let Some(payment_credential) = payment_credential {
             let payment_utxos = db
                 .get_utxos(
-                    payment_credential,
-                    CredentialKind::Payment,
+                    Some((payment_credential, CredentialKind::Payment)),
                     TxoQuery::All(Some(0)),
                     0,
                     100,
@@ -740,6 +788,52 @@ mod tests {
         assert!(!filtered.is_empty());
     }
 
+    #[tokio::test]
+    async fn index_filters_unspent_by_unit_without_scope() {
+        let db_path = DBPath::new("_index_unspent_by_unit_global");
+        let db = RocksDB::new(&db_path);
+
+        let tx = Transaction::from_cbor_bytes(&*hex::decode(TX_PRODUCE).unwrap()).unwrap();
+        let hash = tx.canonical_hash();
+
+        let outputs_vec = tx.body.outputs.to_vec();
+        let unit = outputs_vec
+            .iter()
+            .find_map(|output| {
+                for (policy_id, assets) in output.value().multiasset.iter() {
+                    let policy_hex = policy_id.to_string();
+                    for (asset_name, _) in assets.iter() {
+                        let mut unit = policy_hex.clone();
+                        unit.push_str(&asset_name.to_raw_hex());
+                        return Some(unit);
+                    }
+                }
+                None
+            })
+            .expect("expected multi-asset utxo");
+
+        let inputs: Vec<_> = tx
+            .body
+            .inputs
+            .clone()
+            .into_iter()
+            .map(|i| i.into())
+            .collect();
+        let outputs_for_db: Vec<_> = outputs_vec.into_iter().enumerate().collect();
+
+        db.apply(hash, inputs, outputs_for_db, Some(1)).await;
+
+        let global = db
+            .get_utxos(None, TxoQuery::UnspentByUnit(unit.clone()), 0, 100)
+            .await;
+
+        assert!(global
+            .iter()
+            .all(|txo| super::output_contains_unit(&txo.output, &unit)));
+        assert!(!global.is_empty());
+        assert!(global.iter().all(|txo| !txo.spent));
+    }
+
     async fn test_utxo_resolving(
         txs: Vec<(&str, Option<Slot>)>,
         credential_hex: &str,
@@ -760,7 +854,7 @@ mod tests {
             )
             .await;
         }
-        db.get_utxos(credential, kind, q, 0, 100).await
+        db.get_utxos(Some((credential, kind)), q, 0, 100).await
     }
 
     const TX_PRODUCE: &str = "84a7008182582086ecf8a72d7d1744deefc1c923c7f1ed8eb09a549cb70fde3d572316e066bfa403018182583901bed3c3bac9ddc7952cc91cf76db3dd808f99f4a0dd07e78e06657bc21cc69f513f9551f517c5212855ece1b34d0128f9f9b54e47cebadd4b821b0000000103f98686ad581c0ece814aa1cc2c98981c7690083dbcb51c5bb1279ae408873d8c8762a15820595479793659676e546b3069574c396a4544315943352f49516873337252343701581c15509d4cb60f066ca4c7e982d764d6ceb4324cb33776d1711da1beeea24e42616279416c69656e3034373231014e42616279416c69656e303831313801581c279c909f348e533da5808898f87f9a14bb2c3dfbbacccd631d927a3fa144534e454b19a839581c29d222ce763455e3d7a09a665ce554f00ac89d2e99a1a83d267170c6a1434d494e194a31581c51a5e236c4de3af2b8020442e2a26f454fda3b04cb621c1294a0ef34a144424f4f4b1a0165f8a0581c530a197fe7c275f204c3396b3782fc738f4968f0c81dd2291cf07b8aa3581a434330303337303030303030303030303030303135323030303001581a434330303337303030303030303030303030303135323030363401581a434330313531303030303030303030303030303137363030363401581c5ee425062d88069b702a38a357895132b9b50c8f893c8cf87a4c8c32a14445574d5401581ca0028f350aaabe0545fdcb56b039bfb08e4bb4d8c4d7c3c7d481c235a145484f534b591a04277dbf581ca7904896a247d3aa09478e856769b82d1f2e060028b6bda5543b699fa64d4343434f4c4c41423030303337014d4343434f4c4c41423030313531014d4343434f4c4c41423038393235014d4343434f4c4c4142303930333901581c4375746543726561747572657343686164694e61737361723030333701581c4375746543726561747572657343686164694e61737361723031353101581ce5a42a1a1d3d1da71b0449663c32798725888d2eb0843c4dabeca05aa151576f726c644d6f62696c65546f6b656e581a000f4240581cecbe846aa1a535579d67f9480fa6173b64d7e239df0460eba36e3ad0a14a0014df1053617475726e1a000f4240581cf0ff48bbb7bbe9d59a40f1ce90e9e9d0ff5002ec48f232b49ca0fb9aa14b736f667462696e61746f7201581cfe38ef97888dfde0292b7d2ed103543ecf92a419a29634f513a1d71fa14541534e454b1a00249f00021a00033cd9031a0936d6fe048183028200581c1cc69f513f9551f517c5212855ece1b34d0128f9f9b54e47cebadd4b581c538299a358e79a289c8de779f8cd09dd6a6bb286de717d1f744bb35705a1581de11cc69f513f9551f517c5212855ece1b34d0128f9f9b54e47cebadd4b1a002bdbc50758201c45c96126112c50a121c7bce6fa0b0fb8e7fa6990d0a9435a89a91a1460fccea1008282582061b2624741ddbcd41a6e3490b2e4a71bcc1cb6ff891137097540ad7fa8cf56115840a00c437ed8a787f4fbdd39ada04c3cf6191ee26abe44137a6eb4a2dcf55e4387bfbb565133d42df61f0ed45de43adeec019c2f8c5e0fae209534a266755b96038258201b775e64b1cb83f9420829d807b892da0c8c2ea89873028c620b8c04eb35ee4558400d97db78925083b9736b66ccf28593638cba828f5806311eb6d4aa7d861a53023a2ab27a5f56d65beafb177f756e746f98e093a8c56c5982667e4f2f5abf8403f5a11902a2a1636d736781781956455350523a20506172746e65722044656c65676174696f6e";
