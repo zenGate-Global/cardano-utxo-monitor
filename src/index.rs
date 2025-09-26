@@ -97,6 +97,7 @@ pub trait UtxoResolver {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum TxoQuery {
     All(Option<Slot>),
     Unspent,
@@ -126,6 +127,7 @@ struct Cols<'a> {
     payment_unspent_cf: &'a ColumnFamily,
     stake_events_cf: &'a ColumnFamily,
     stake_unspent_cf: &'a ColumnFamily,
+    unit_unspent_cf: &'a ColumnFamily,
 }
 
 impl<'a> Cols<'a> {
@@ -137,27 +139,30 @@ impl<'a> Cols<'a> {
     }
 }
 
-fn get_columns(db: &Arc<TransactionDB>) -> Cols {
+fn get_columns(db: &Arc<TransactionDB>) -> Cols<'_> {
     let txo_cf = db.cf_handle(TABLES[0]).unwrap();
     let payment_events_cf = db.cf_handle(TABLES[1]).unwrap();
     let payment_unspent_cf = db.cf_handle(TABLES[2]).unwrap();
     let stake_events_cf = db.cf_handle(TABLES[3]).unwrap();
     let stake_unspent_cf = db.cf_handle(TABLES[4]).unwrap();
+    let unit_unspent_cf = db.cf_handle(TABLES[5]).unwrap();
     Cols {
         txo_cf,
         payment_events_cf,
         payment_unspent_cf,
         stake_events_cf,
         stake_unspent_cf,
+        unit_unspent_cf,
     }
 }
 
-const TABLES: [&str; 5] = [
+const TABLES: [&str; 6] = [
     "txo",
     "pkh_to_txo_events",
     "pkh_to_txo_unspent",
     "stake_cred_to_txo_events",
     "stake_cred_to_txo_unspent",
+    "unit_to_txo_unspent",
 ];
 
 fn utxo_key(rf: OutputRef) -> Vec<u8> {
@@ -198,6 +203,121 @@ fn credential_to_utxo_unspent_key(credential: &Credential, rf: OutputRef) -> Vec
     let mut key = credential_key_prefix(credential);
     key.extend(utxo_key(rf));
     key
+}
+
+const UNIT_INDEX_SENTINEL: u8 = 0;
+
+fn unit_index_key_prefix(unit: &str) -> Vec<u8> {
+    unit.as_bytes().to_vec()
+}
+
+fn unit_index_entry_key(prefix: &[u8], oref: OutputRef) -> Vec<u8> {
+    let mut key = Vec::with_capacity(prefix.len() + 16);
+    key.extend_from_slice(prefix);
+    key.extend(utxo_key(oref));
+    key
+}
+
+fn unit_index_sentinel_key(prefix: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(prefix.len() + 1);
+    key.extend_from_slice(prefix);
+    key.push(UNIT_INDEX_SENTINEL);
+    key
+}
+
+fn output_units(output: &TransactionOutput) -> Vec<String> {
+    output
+        .value()
+        .multiasset
+        .iter()
+        .flat_map(|(policy_id, assets)| {
+            let policy_hex = policy_id.to_string();
+            assets.iter().map(move |(asset_name, _)| {
+                let asset_hex = asset_name.to_raw_hex();
+                let mut combined = String::with_capacity(policy_hex.len() + asset_hex.len());
+                combined.push_str(&policy_hex);
+                combined.push_str(&asset_hex);
+                combined.make_ascii_lowercase();
+                combined
+            })
+        })
+        .collect()
+}
+
+fn write_unit_indexes(
+    tx: &Transaction<TransactionDB>,
+    unit_cf: &ColumnFamily,
+    output: &TransactionOutput,
+    oref: OutputRef,
+) {
+    for unit in output_units(output) {
+        let prefix = unit_index_key_prefix(&unit);
+        let sentinel = unit_index_sentinel_key(&prefix);
+        let _ = tx.delete_cf(unit_cf, sentinel);
+        let key = unit_index_entry_key(&prefix, oref);
+        tx.put_cf(unit_cf, key, vec![]).unwrap();
+    }
+}
+
+fn delete_unit_indexes(
+    tx: &Transaction<TransactionDB>,
+    unit_cf: &ColumnFamily,
+    output: &TransactionOutput,
+    oref: OutputRef,
+) {
+    for unit in output_units(output) {
+        let prefix = unit_index_key_prefix(&unit);
+        let key = unit_index_entry_key(&prefix, oref);
+        let _ = tx.delete_cf(unit_cf, key);
+    }
+}
+
+fn ensure_unit_index(db: &Arc<TransactionDB>, cols: &Cols, unit_prefix: &str) {
+    let prefix = unit_index_key_prefix(unit_prefix);
+    let sentinel = unit_index_sentinel_key(&prefix);
+
+    {
+        let snap = db.snapshot();
+        let mut iter = get_range_iterator(&snap, cols.unit_unspent_cf, prefix.clone(), None);
+        while let Some(Ok((key, _))) = iter.next() {
+            if key.len() == prefix.len() + 1 && key[prefix.len()] == UNIT_INDEX_SENTINEL {
+                continue;
+            }
+            return;
+        }
+    }
+
+    let tx = db.transaction();
+    let mut iter = db.iterator_cf(cols.txo_cf, IteratorMode::Start);
+    let mut found = false;
+
+    while let Some(Ok((key, bytes))) = iter.next() {
+        if let Ok((utxo_bytes, _settled_at, spent)) =
+            rmp_serde::from_slice::<(Vec<u8>, Option<Slot>, bool)>(&bytes)
+        {
+            if spent {
+                continue;
+            }
+
+            if let Ok(output) = TransactionOutput::from_cbor_bytes(&utxo_bytes) {
+                if output_contains_unit(&output, unit_prefix) {
+                    found = true;
+                    let mut index_key = Vec::with_capacity(prefix.len() + key.len());
+                    index_key.extend_from_slice(&prefix);
+                    index_key.extend_from_slice(&key);
+                    tx.put_cf(cols.unit_unspent_cf, index_key, vec![]).unwrap();
+                }
+            }
+        }
+    }
+
+    if found {
+        let _ = tx.delete_cf(cols.unit_unspent_cf, sentinel);
+    } else {
+        tx.put_cf(cols.unit_unspent_cf, sentinel, vec![]).unwrap();
+    }
+
+    tx.commit().unwrap();
 }
 
 fn get_utxo_by_ref(
@@ -280,6 +400,7 @@ fn update_unspent_txo(
             tx, events_cf, unspent_cf, credential, oref, settled_at, false,
         );
     }
+    write_unit_indexes(tx, cols.unit_unspent_cf, &txo, oref);
     write_txo(tx, cols.txo_cf, oref, txo, settled_at, false);
 }
 
@@ -316,6 +437,10 @@ fn update_txo_by_ref(
                 index_spent,
             );
         }
+        delete_unit_indexes(tx, cols.unit_unspent_cf, &out, oref);
+        if !spent {
+            write_unit_indexes(tx, cols.unit_unspent_cf, &out, oref);
+        }
         write_txo(tx, cols.txo_cf, oref, out, settled_at, spent);
     }
 }
@@ -345,6 +470,7 @@ fn delete_txo_and_indexes(tx: &Transaction<TransactionDB>, cols: &Cols, oref: Ou
             let (events_cf, unspent_cf) = cols.index_cfs(*kind);
             delete_indexes(tx, events_cf, unspent_cf, credential, settled_at, oref);
         }
+        delete_unit_indexes(tx, cols.unit_unspent_cf, &out, oref);
         tx.delete_cf(cols.txo_cf, utxo_key(oref)).unwrap();
     }
 }
@@ -415,6 +541,14 @@ impl UtxoResolver for RocksDB {
             }
 
             let cols = get_columns(&db);
+            let mut unit_prefix_cache: Option<String> = None;
+            if scope.is_none() {
+                if let TxoQuery::UnspentByUnit(unit) = &query {
+                    let lower = unit.to_ascii_lowercase();
+                    ensure_unit_index(&db, &cols, &lower);
+                    unit_prefix_cache = Some(lower);
+                }
+            }
             let snap = db.snapshot();
 
             match (scope, query) {
@@ -478,40 +612,58 @@ impl UtxoResolver for RocksDB {
                     txo_set
                 }
                 (None, TxoQuery::UnspentByUnit(unit)) => {
-                    let mut txo_iter = snap.iterator_cf(cols.txo_cf, IteratorMode::Start);
+                    let unit_prefix = unit_prefix_cache
+                        .take()
+                        .unwrap_or_else(|| unit.to_ascii_lowercase());
+                    let prefix_len = unit_prefix.len();
+                    let mut txo_iter = get_range_iterator(
+                        &snap,
+                        cols.unit_unspent_cf,
+                        unit_index_key_prefix(&unit_prefix),
+                        None,
+                    );
                     let mut txo_set = Vec::new();
                     let mut matched = 0usize;
 
-                    while let Some(Ok((key, bytes))) = txo_iter.next() {
-                        if let Ok((utxo_bytes, settled_at, spent)) =
-                            rmp_serde::from_slice::<(Vec<u8>, Option<Slot>, bool)>(&bytes)
+                    while let Some(Ok((key, _))) = txo_iter.next() {
+                        if key.len() == prefix_len + 1 && key[prefix_len] == UNIT_INDEX_SENTINEL {
+                            continue;
+                        }
+
+                        let utxo_key = &key[prefix_len..];
+
+                        if let Some((output, settled_at, spent)) = snap
+                            .get_cf(cols.txo_cf, utxo_key)
+                            .unwrap()
+                            .and_then(|bytes| {
+                                rmp_serde::from_slice::<(Vec<u8>, Option<Slot>, bool)>(&bytes).ok()
+                            })
+                            .and_then(|(utxo_bytes, settled_at, spent)| {
+                                TransactionOutput::from_cbor_bytes(&utxo_bytes)
+                                    .ok()
+                                    .map(|o| (o, settled_at, spent))
+                            })
                         {
                             if spent {
                                 continue;
                             }
 
-                            if let Ok(output) = TransactionOutput::from_cbor_bytes(&utxo_bytes) {
-                                if !output_contains_unit(&output, &unit) {
-                                    continue;
-                                }
-
-                                if matched < offset {
-                                    matched += 1;
-                                    continue;
-                                }
-
-                                let oref = rmp_serde::from_slice::<OutputRef>(&key).unwrap();
-                                txo_set.push(Txo {
-                                    oref,
-                                    output,
-                                    settled_at,
-                                    spent,
-                                });
+                            if matched < offset {
                                 matched += 1;
+                                continue;
+                            }
 
-                                if txo_set.len() >= limit {
-                                    break;
-                                }
+                            let oref = rmp_serde::from_slice::<OutputRef>(utxo_key).unwrap();
+                            txo_set.push(Txo {
+                                oref,
+                                output,
+                                settled_at,
+                                spent,
+                            });
+                            matched += 1;
+
+                            if txo_set.len() >= limit {
+                                break;
                             }
                         }
                     }
@@ -527,22 +679,10 @@ impl UtxoResolver for RocksDB {
 }
 
 fn output_contains_unit(output: &TransactionOutput, unit: &str) -> bool {
-    output
-        .value()
-        .multiasset
-        .iter()
-        .flat_map(|(policy_id, assets)| {
-            let policy_hex = policy_id.to_string();
-            assets
-                .iter()
-                .map(move |(asset_name, _)| (policy_hex.clone(), asset_name.to_raw_hex()))
-        })
-        .any(|(policy_hex, asset_hex)| {
-            let mut combined = String::with_capacity(policy_hex.len() + asset_hex.len());
-            combined.push_str(&policy_hex);
-            combined.push_str(&asset_hex);
-            combined.eq_ignore_ascii_case(unit)
-        })
+    let unit_lower = unit.to_ascii_lowercase();
+    output_units(output)
+        .into_iter()
+        .any(|candidate| candidate == unit_lower)
 }
 
 pub(crate) fn get_range_iterator<'a: 'b, 'b>(
@@ -567,13 +707,16 @@ pub(crate) fn get_range_iterator<'a: 'b, 'b>(
 
 #[cfg(test)]
 mod tests {
-    use crate::index::{CredentialKind, RocksDB, Txo, TxoQuery, UtxoIndex, UtxoResolver};
+    use crate::index::{
+        unit_index_key_prefix, unit_index_sentinel_key, CredentialKind, RocksDB, Txo, TxoQuery,
+        UtxoIndex, UtxoResolver, UNIT_INDEX_SENTINEL,
+    };
     use cml_chain::certs::Credential;
     use cml_chain::transaction::Transaction;
     use cml_chain::{Deserialize, Slot};
     use cml_crypto::Ed25519KeyHash;
     use cml_crypto::RawBytesEncoding;
-    use rocksdb::{Options, SingleThreaded, TransactionDB};
+    use rocksdb::{IteratorMode, Options, SingleThreaded, TransactionDB};
     use spectrum_cardano_lib::transaction::TransactionOutputExtension;
     use spectrum_cardano_lib::OutputRef;
     use spectrum_offchain::tx_hash::CanonicalHash;
@@ -832,6 +975,58 @@ mod tests {
             .all(|txo| super::output_contains_unit(&txo.output, &unit)));
         assert!(!global.is_empty());
         assert!(global.iter().all(|txo| !txo.spent));
+
+        let unit_lower = unit.to_ascii_lowercase();
+        let unit_cf = db.db.cf_handle("unit_to_txo_unspent").unwrap();
+        let mut iter = db.db.iterator_cf(unit_cf, IteratorMode::Start);
+        let mut has_entry = false;
+        while let Some(Ok((key, _))) = iter.next() {
+            if key.starts_with(unit_lower.as_bytes())
+                && !(key.len() == unit_lower.len() + 1
+                    && key[unit_lower.len()] == UNIT_INDEX_SENTINEL)
+            {
+                has_entry = true;
+                break;
+            }
+        }
+        assert!(has_entry);
+    }
+
+    #[tokio::test]
+    async fn unit_index_marks_empty_queries() {
+        let db_path = DBPath::new("_index_unit_missing_marker");
+        let db = RocksDB::new(&db_path);
+
+        let tx = Transaction::from_cbor_bytes(&*hex::decode(TX_PRODUCE).unwrap()).unwrap();
+        let hash = tx.canonical_hash();
+
+        let inputs: Vec<_> = tx
+            .body
+            .inputs
+            .clone()
+            .into_iter()
+            .map(|i| i.into())
+            .collect();
+        let outputs_for_db: Vec<_> = tx.body.outputs.to_vec().into_iter().enumerate().collect();
+
+        db.apply(hash, inputs, outputs_for_db, Some(1)).await;
+
+        let missing_unit = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+        let results = db
+            .get_utxos(
+                None,
+                TxoQuery::UnspentByUnit(missing_unit.to_string()),
+                0,
+                10,
+            )
+            .await;
+        assert!(results.is_empty());
+
+        let unit_cf = db.db.cf_handle("unit_to_txo_unspent").unwrap();
+        let prefix = unit_index_key_prefix(&missing_unit.to_ascii_lowercase());
+        let sentinel = unit_index_sentinel_key(&prefix);
+        assert!(db.db.get_cf(unit_cf, sentinel).unwrap().is_some());
     }
 
     async fn test_utxo_resolving(
