@@ -70,8 +70,23 @@ Query UTXOs for a specific public key hash.
   "pkh": "YOUR_PUBLIC_KEY_HASH",
   "query": "Unspent",
   "offset": 0,
-  "limit": 100
+  "limit": 100,
+  "includeCborHex": false
 }
+```
+
+Set `"includeCborHex": true` to receive compact responses where each entry only
+contains the transaction hash, output index, and canonical CBOR encoding of the
+UTXO:
+
+```json
+[
+  {
+    "transactionHash": "<HASH>",
+    "index": 0,
+    "cbor": "<CBOR_HEX>"
+  }
+]
 ```
 
 **Query Types:**
@@ -144,7 +159,8 @@ once and supply individual lookup parameters for each entry.
     }
   ],
   "offset": 0,
-  "limit": 50
+  "limit": 50,
+  "includeCborHex": true
 }
 ```
 

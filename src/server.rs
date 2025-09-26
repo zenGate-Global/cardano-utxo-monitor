@@ -41,6 +41,8 @@ pub struct GetTxOsRequest {
     lookup: GetTxOsLookup,
     offset: usize,
     limit: usize,
+    #[serde(default)]
+    include_cbor_hex: bool,
 }
 
 #[derive(Clone, serde::Serialize, Debug)]
@@ -55,6 +57,14 @@ pub struct UTxO {
     pub datum_hash: Option<String>,
     pub datum: Option<String>,
     pub script_ref: Option<ScriptRefDto>,
+}
+
+#[derive(Clone, serde::Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct UTxOCbor {
+    pub transaction_hash: TransactionHash,
+    pub index: usize,
+    pub cbor: String,
 }
 
 impl From<Txo> for UTxO {
@@ -110,6 +120,33 @@ impl From<Txo> for UTxO {
             datum,
             script_ref,
         }
+    }
+}
+
+impl From<Txo> for UTxOCbor {
+    fn from(txo: Txo) -> Self {
+        Self {
+            transaction_hash: txo.oref.tx_hash(),
+            index: txo.oref.index() as usize,
+            cbor: hex::encode(txo.output.to_cbor_bytes()),
+        }
+    }
+}
+
+#[derive(Clone, serde::Serialize, Debug)]
+#[serde(untagged)]
+pub enum UTxOResponse {
+    Detailed(UTxO),
+    Compact(UTxOCbor),
+}
+
+impl UTxOResponse {
+    fn detailed(txo: Txo) -> Self {
+        UTxOResponse::Detailed(UTxO::from(txo))
+    }
+
+    fn compact(txo: Txo) -> Self {
+        UTxOResponse::Compact(UTxOCbor::from(txo))
     }
 }
 
@@ -232,6 +269,7 @@ where
         lookup,
         offset,
         limit,
+        include_cbor_hex,
     } = req.into_inner();
 
     let query = lookup.query.clone();
@@ -247,7 +285,16 @@ where
     };
 
     let utxos = db.get_utxos(scope, query, offset, limit).await;
-    let result = utxos.into_iter().map(UTxO::from).collect::<Vec<_>>();
+    let result = utxos
+        .into_iter()
+        .map(|txo| {
+            if include_cbor_hex {
+                UTxOResponse::compact(txo)
+            } else {
+                UTxOResponse::detailed(txo)
+            }
+        })
+        .collect::<Vec<_>>();
     HttpResponse::Ok().json(result)
 }
 
@@ -255,7 +302,7 @@ where
 #[serde(rename_all = "camelCase")]
 pub struct GetTxOsBatchResponseItem {
     pub request: GetTxOsLookup,
-    pub utxos: Vec<UTxO>,
+    pub utxos: Vec<UTxOResponse>,
     pub error: Option<String>,
 }
 
@@ -265,6 +312,8 @@ pub struct GetTxOsBatchRequest {
     pub requests: Vec<GetTxOsLookup>,
     pub offset: usize,
     pub limit: usize,
+    #[serde(default)]
+    pub include_cbor_hex: bool,
 }
 
 #[derive(Clone, serde::Serialize, Debug)]
@@ -283,6 +332,7 @@ where
         requests,
         offset,
         limit,
+        include_cbor_hex,
     } = req.into_inner();
     let mut responses = Vec::with_capacity(requests.len());
 
@@ -296,9 +346,19 @@ where
             Ok(scope) => {
                 let query = request.query.clone();
                 let utxos = db.get_utxos(scope, query, offset, limit).await;
+                let utxos = utxos
+                    .into_iter()
+                    .map(|txo| {
+                        if include_cbor_hex {
+                            UTxOResponse::compact(txo)
+                        } else {
+                            UTxOResponse::detailed(txo)
+                        }
+                    })
+                    .collect();
                 responses.push(GetTxOsBatchResponseItem {
                     request,
-                    utxos: utxos.into_iter().map(UTxO::from).collect(),
+                    utxos,
                     error: None,
                 });
             }
@@ -393,6 +453,7 @@ mod tests {
             lookup: sample_lookup_all.clone(),
             offset: 0,
             limit: 10,
+            include_cbor_hex: false,
         };
 
         let json = serde_json::to_string_pretty(&sample_request_all).unwrap();
@@ -410,6 +471,7 @@ mod tests {
             lookup: sample_lookup_unspent.clone(),
             offset: 0,
             limit: 10,
+            include_cbor_hex: false,
         };
 
         let json = serde_json::to_string_pretty(&sample_request_unspent).unwrap();
@@ -438,6 +500,7 @@ mod tests {
             lookup: sample_lookup_unspent_by_unit.clone(),
             offset: 0,
             limit: 10,
+            include_cbor_hex: true,
         };
 
         let json = serde_json::to_string_pretty(&sample_request_unspent_by_unit).unwrap();
@@ -453,6 +516,7 @@ mod tests {
             ],
             offset: 0,
             limit: 10,
+            include_cbor_hex: true,
         };
         let batch_json = serde_json::to_string_pretty(&batch_request).unwrap();
         assert!(!batch_json.is_empty());
