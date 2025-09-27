@@ -393,15 +393,48 @@ fn update_unspent_txo(
     settled_at: Option<Slot>,
 ) {
     let credentials = address_credentials(txo.address());
-    delete_txo_and_indexes(tx, cols, oref);
+    let mut spent = false;
+
+    if let Some((existing_out, existing_settled_at, existing_spent)) =
+        get_utxo_by_ref(tx, cols.txo_cf, oref)
+    {
+        trace!(
+            "Updating txo {} from confirmation, preserving spent: {}",
+            oref, existing_spent
+        );
+        let existing_credentials = address_credentials(existing_out.address());
+        for (kind, credential) in &existing_credentials {
+            let (events_cf, unspent_cf) = cols.index_cfs(*kind);
+            delete_indexes(
+                tx,
+                events_cf,
+                unspent_cf,
+                credential,
+                existing_settled_at,
+                oref,
+            );
+        }
+        delete_unit_indexes(tx, cols.unit_unspent_cf, &existing_out, oref);
+        tx.delete_cf(cols.txo_cf, utxo_key(oref)).unwrap();
+        spent = existing_spent;
+    }
+
     for (kind, credential) in &credentials {
         let (events_cf, unspent_cf) = cols.index_cfs(*kind);
         write_secondary_indexes(
-            tx, events_cf, unspent_cf, credential, oref, settled_at, false,
+            tx,
+            events_cf,
+            unspent_cf,
+            credential,
+            oref,
+            settled_at,
+            spent,
         );
     }
-    write_unit_indexes(tx, cols.unit_unspent_cf, &txo, oref);
-    write_txo(tx, cols.txo_cf, oref, txo, settled_at, false);
+    if !spent {
+        write_unit_indexes(tx, cols.unit_unspent_cf, &txo, oref);
+    }
+    write_txo(tx, cols.txo_cf, oref, txo, settled_at, spent);
 }
 
 fn update_txo_by_ref(
@@ -766,6 +799,106 @@ mod tests {
             .find(|e| e.oref == must_consume_utxo)
             .map(|txo| txo.spent)
             .unwrap())
+    }
+
+    #[tokio::test]
+    async fn confirmation_preserves_pending_spend_state() {
+        let db_path = DBPath::new("_index_confirm_preserves_pending");
+        let db = RocksDB::new(&db_path);
+
+        let produce_tx = Transaction::from_cbor_bytes(&*hex::decode(TX_PRODUCE).unwrap()).unwrap();
+        let produce_hash = produce_tx.canonical_hash();
+        let produce_inputs: Vec<_> = produce_tx
+            .body
+            .inputs
+            .clone()
+            .into_iter()
+            .map(|i| i.into())
+            .collect();
+        let produce_outputs_for_db: Vec<_> = produce_tx
+            .body
+            .outputs
+            .to_vec()
+            .into_iter()
+            .enumerate()
+            .collect();
+        db.apply(produce_hash, produce_inputs, produce_outputs_for_db, None)
+            .await;
+
+        let consume_tx = Transaction::from_cbor_bytes(&*hex::decode(TX_CONSUME).unwrap()).unwrap();
+        let consume_hash = consume_tx.canonical_hash();
+        let consume_inputs: Vec<_> = consume_tx
+            .body
+            .inputs
+            .clone()
+            .into_iter()
+            .map(|i| i.into())
+            .collect();
+        let consume_outputs_for_db: Vec<_> = consume_tx
+            .body
+            .outputs
+            .to_vec()
+            .into_iter()
+            .enumerate()
+            .collect();
+        db.apply(consume_hash, consume_inputs, consume_outputs_for_db, None)
+            .await;
+
+        let produce_tx_confirmed =
+            Transaction::from_cbor_bytes(&*hex::decode(TX_PRODUCE).unwrap()).unwrap();
+        let produce_inputs_confirmed: Vec<_> = produce_tx_confirmed
+            .body
+            .inputs
+            .clone()
+            .into_iter()
+            .map(|i| i.into())
+            .collect();
+        let produce_outputs_confirmed: Vec<_> = produce_tx_confirmed
+            .body
+            .outputs
+            .to_vec()
+            .into_iter()
+            .enumerate()
+            .collect();
+        db.apply(
+            produce_tx_confirmed.canonical_hash(),
+            produce_inputs_confirmed,
+            produce_outputs_confirmed,
+            Some(1),
+        )
+        .await;
+
+        let credential = Credential::new_pub_key(
+            Ed25519KeyHash::from_hex("bed3c3bac9ddc7952cc91cf76db3dd808f99f4a0dd07e78e06657bc2")
+                .unwrap(),
+        );
+        let target_oref = OutputRef::from_string_unsafe(
+            "13de3390f33b18faaeeb91eafc839e28c687f47f146e9c68779562a8a5385afc#0",
+        );
+
+        let all = db
+            .get_utxos(
+                Some((credential.clone(), CredentialKind::Payment)),
+                TxoQuery::All(Some(0)),
+                0,
+                10,
+            )
+            .await;
+        let entry = all
+            .iter()
+            .find(|txo| txo.oref == target_oref)
+            .expect("pending spend should remain tracked");
+        assert!(entry.spent);
+
+        let unspent = db
+            .get_utxos(
+                Some((credential, CredentialKind::Payment)),
+                TxoQuery::Unspent,
+                0,
+                10,
+            )
+            .await;
+        assert!(unspent.iter().all(|txo| txo.oref != target_oref));
     }
 
     #[tokio::test]
