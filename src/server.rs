@@ -11,10 +11,12 @@ use cml_core::serialization::Serialize;
 use cml_crypto::{Ed25519KeyHash, RawBytesEncoding, ScriptHash, TransactionHash};
 use spectrum_cardano_lib::transaction::TransactionOutputExtension;
 use std::io;
-use std::marker::PhantomData;
 use std::net::SocketAddr;
+use utoipa::OpenApi;
+use utoipa::ToSchema;
+use utoipa_swagger_ui::SwaggerUi;
 
-#[derive(Clone, serde::Deserialize, serde::Serialize, Debug, Default)]
+#[derive(Clone, serde::Deserialize, serde::Serialize, Debug, Default, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum AddressQueryMode {
     #[default]
@@ -22,19 +24,39 @@ pub enum AddressQueryMode {
     ByStakingCredential,
 }
 
-#[derive(Clone, serde::Deserialize, serde::Serialize, Debug)]
+#[derive(Clone, serde::Deserialize, serde::Serialize, Debug, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum ApiTxoQuery {
+    All(Option<u64>),
+    Unspent,
+    UnspentByUnit(String),
+}
+
+impl From<ApiTxoQuery> for TxoQuery {
+    fn from(value: ApiTxoQuery) -> Self {
+        match value {
+            ApiTxoQuery::All(slot) => TxoQuery::All(slot),
+            ApiTxoQuery::Unspent => TxoQuery::Unspent,
+            ApiTxoQuery::UnspentByUnit(unit) => TxoQuery::UnspentByUnit(unit),
+        }
+    }
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize, Debug, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GetTxOsLookup {
     #[serde(default)]
+    #[schema(nullable = true, example = "addr_test1...")]
     address: Option<String>,
     #[serde(default)]
+    #[schema(nullable = true, example = "f1c2...")]
     hash: Option<String>,
     #[serde(default)]
     mode: AddressQueryMode,
-    query: TxoQuery,
+    query: ApiTxoQuery,
 }
 
-#[derive(Clone, serde::Deserialize, serde::Serialize, Debug)]
+#[derive(Clone, serde::Deserialize, serde::Serialize, Debug, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GetTxOsRequest {
     #[serde(flatten)]
@@ -45,11 +67,13 @@ pub struct GetTxOsRequest {
     include_cbor_hex: bool,
 }
 
-#[derive(Clone, serde::Serialize, Debug)]
+#[derive(Clone, serde::Serialize, Debug, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UTxO {
+    #[schema(value_type = String, example = "a1b2c3...")]
     pub transaction_hash: TransactionHash,
     pub index: usize,
+    #[schema(value_type = String, example = "addr1...")]
     pub address: Address,
     pub value: Vec<Asset>,
     pub settled_at: Option<u64>,
@@ -59,9 +83,10 @@ pub struct UTxO {
     pub script_ref: Option<ScriptRefDto>,
 }
 
-#[derive(Clone, serde::Serialize, Debug)]
+#[derive(Clone, serde::Serialize, Debug, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UTxOCbor {
+    #[schema(value_type = String, example = "a1b2c3...")]
     pub transaction_hash: TransactionHash,
     pub index: usize,
     pub cbor: String,
@@ -133,7 +158,7 @@ impl From<Txo> for UTxOCbor {
     }
 }
 
-#[derive(Clone, serde::Serialize, Debug)]
+#[derive(Clone, serde::Serialize, Debug, ToSchema)]
 #[serde(untagged)]
 pub enum UTxOResponse {
     Detailed(UTxO),
@@ -150,7 +175,7 @@ impl UTxOResponse {
     }
 }
 
-#[derive(Clone, serde::Serialize, Debug)]
+#[derive(Clone, serde::Serialize, Debug, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Asset {
     pub policy_id: String,
@@ -158,7 +183,7 @@ pub struct Asset {
     pub amount: String,
 }
 
-#[derive(Clone, serde::Serialize, Debug)]
+#[derive(Clone, serde::Serialize, Debug, ToSchema)]
 pub struct ScriptRefDto {
     #[serde(rename = "type")]
     pub script_type: ScriptType,
@@ -188,7 +213,7 @@ impl ScriptRefDto {
     }
 }
 
-#[derive(Clone, serde::Serialize, Debug)]
+#[derive(Clone, serde::Serialize, Debug, ToSchema)]
 pub enum ScriptType {
     Native,
     PlutusV1,
@@ -196,7 +221,30 @@ pub enum ScriptType {
     PlutusV3,
 }
 
-pub struct Service<R>(PhantomData<R>);
+#[derive(OpenApi)]
+#[openapi(
+    paths(healthcheck, get_utxos, get_utxos_batch),
+    components(schemas(
+        AddressQueryMode,
+        ApiTxoQuery,
+        GetTxOsLookup,
+        GetTxOsRequest,
+        UTxO,
+        UTxOCbor,
+        UTxOResponse,
+        Asset,
+        ScriptRefDto,
+        ScriptType,
+        GetTxOsBatchRequest,
+        GetTxOsBatchResponse,
+        GetTxOsBatchResponseItem
+    )),
+    tags(
+        (name = "Health", description = "Service health endpoints"),
+        (name = "UTxO", description = "UTxO lookup endpoints")
+    )
+)]
+pub struct ApiDoc;
 
 fn credential_from_hash(hash_str: &str) -> Result<Credential, String> {
     if let Ok(hash) = Ed25519KeyHash::from_hex(hash_str) {
@@ -222,7 +270,7 @@ fn resolve_request_credentials(
     address: Option<&String>,
     hash: Option<&String>,
     mode: AddressQueryMode,
-    query: &TxoQuery,
+    query: &ApiTxoQuery,
 ) -> Result<Option<(Credential, CredentialKind)>, String> {
     if let Some(address) = address {
         let address =
@@ -255,12 +303,22 @@ fn resolve_request_credentials(
         Ok(Some((credential, kind)))
     } else {
         match query {
-            TxoQuery::UnspentByUnit(_) => Ok(None),
+            ApiTxoQuery::UnspentByUnit(_) => Ok(None),
             _ => Err("Either address or hash field is required unless querying unspentByUnit without a credential.".to_string()),
         }
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/getUtxos",
+    request_body = GetTxOsRequest,
+    responses(
+        (status = 200, description = "Found matching UTxOs", body = [UTxOResponse]),
+        (status = 400, description = "Invalid request", body = String)
+    ),
+    tag = "UTxO"
+)]
 async fn get_utxos<R>(req: web::Json<GetTxOsRequest>, db: Data<R>) -> impl Responder
 where
     R: UtxoResolver + 'static,
@@ -272,17 +330,19 @@ where
         include_cbor_hex,
     } = req.into_inner();
 
-    let query = lookup.query.clone();
+    let query_api = lookup.query.clone();
 
     let scope = match resolve_request_credentials(
         lookup.address.as_ref(),
         lookup.hash.as_ref(),
         lookup.mode,
-        &query,
+        &query_api,
     ) {
         Ok(result) => result,
         Err(err) => return HttpResponse::BadRequest().body(err),
     };
+
+    let query: TxoQuery = query_api.into();
 
     let utxos = db.get_utxos(scope, query, offset, limit).await;
     let result = utxos
@@ -298,7 +358,7 @@ where
     HttpResponse::Ok().json(result)
 }
 
-#[derive(Clone, serde::Serialize, Debug)]
+#[derive(Clone, serde::Serialize, Debug, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GetTxOsBatchResponseItem {
     pub request: GetTxOsLookup,
@@ -306,7 +366,7 @@ pub struct GetTxOsBatchResponseItem {
     pub error: Option<String>,
 }
 
-#[derive(Clone, serde::Deserialize, serde::Serialize, Debug)]
+#[derive(Clone, serde::Deserialize, serde::Serialize, Debug, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GetTxOsBatchRequest {
     pub requests: Vec<GetTxOsLookup>,
@@ -316,7 +376,7 @@ pub struct GetTxOsBatchRequest {
     pub include_cbor_hex: bool,
 }
 
-#[derive(Clone, serde::Serialize, Debug)]
+#[derive(Clone, serde::Serialize, Debug, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GetTxOsBatchResponse {
     pub offset: usize,
@@ -324,6 +384,15 @@ pub struct GetTxOsBatchResponse {
     pub responses: Vec<GetTxOsBatchResponseItem>,
 }
 
+#[utoipa::path(
+    post,
+    path = "/getUtxosBatch",
+    request_body = GetTxOsBatchRequest,
+    responses(
+        (status = 200, description = "Batch UTxO lookup result", body = GetTxOsBatchResponse)
+    ),
+    tag = "UTxO"
+)]
 async fn get_utxos_batch<R>(req: web::Json<GetTxOsBatchRequest>, db: Data<R>) -> impl Responder
 where
     R: UtxoResolver + 'static,
@@ -344,7 +413,7 @@ where
             &request.query,
         ) {
             Ok(scope) => {
-                let query = request.query.clone();
+                let query: TxoQuery = request.query.clone().into();
                 let utxos = db.get_utxos(scope, query, offset, limit).await;
                 let utxos = utxos
                     .into_iter()
@@ -395,6 +464,15 @@ fn get_utxos_batch_service<R: UtxoResolver + 'static>() -> actix_web::Resource {
     )
 }
 
+#[utoipa::path(
+    get,
+    path = "/health",
+    responses(
+        (status = 200, description = "Node is synced and serving requests"),
+        (status = 503, description = "Node is syncing")
+    ),
+    tag = "Health"
+)]
 async fn healthcheck(state_synced: Data<Beacon>) -> impl Responder {
     if state_synced.read() {
         HttpResponse::Ok().finish()
@@ -415,6 +493,8 @@ pub async fn build_api_server<R>(
 where
     R: UtxoResolver + Send + Clone + 'static,
 {
+    let openapi = ApiDoc::openapi();
+
     Ok(HttpServer::new(move || {
         let cors = Cors::default()
             .allow_any_origin()
@@ -428,6 +508,7 @@ where
             .service(healthcheck_service())
             .service(get_utxos_service::<R>())
             .service(get_utxos_batch_service::<R>())
+            .service(SwaggerUi::new("/docs/{_:.*}").url("/docs/openapi.json", openapi.clone()))
     })
     .bind(bind_addr)?
     .workers(8)
@@ -446,7 +527,7 @@ mod tests {
             address: Some("addr_test1qpz8h9w8sample000000000000000000000000000000000000".into()),
             hash: None,
             mode: AddressQueryMode::ByPaymentCredential,
-            query: TxoQuery::All(Some(1)),
+            query: ApiTxoQuery::All(Some(1)),
         };
 
         let sample_request_all = GetTxOsRequest {
@@ -464,7 +545,7 @@ mod tests {
             address: Some("addr_test1qpz8h9w8sample000000000000000000000000000000000000".into()),
             hash: None,
             mode: AddressQueryMode::ByStakingCredential,
-            query: TxoQuery::Unspent,
+            query: ApiTxoQuery::Unspent,
         };
 
         let sample_request_unspent = GetTxOsRequest {
@@ -482,7 +563,7 @@ mod tests {
             address: Some("addr_test1qpz8h9w8sample000000000000000000000000000000000000".into()),
             hash: None,
             mode: AddressQueryMode::ByPaymentCredential,
-            query: TxoQuery::UnspentByUnit(
+            query: ApiTxoQuery::UnspentByUnit(
                 "policyid000000000000000000000000000000000000000000asset".into(),
             ),
         };
@@ -491,7 +572,7 @@ mod tests {
             address: None,
             hash: None,
             mode: AddressQueryMode::ByPaymentCredential,
-            query: TxoQuery::UnspentByUnit(
+            query: ApiTxoQuery::UnspentByUnit(
                 "policyid000000000000000000000000000000000000000000asset".into(),
             ),
         };

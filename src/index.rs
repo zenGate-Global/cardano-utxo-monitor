@@ -400,7 +400,8 @@ fn update_unspent_txo(
     {
         trace!(
             "Updating txo {} from confirmation, preserving spent: {}",
-            oref, existing_spent
+            oref,
+            existing_spent
         );
         let existing_credentials = address_credentials(existing_out.address());
         for (kind, credential) in &existing_credentials {
@@ -421,15 +422,7 @@ fn update_unspent_txo(
 
     for (kind, credential) in &credentials {
         let (events_cf, unspent_cf) = cols.index_cfs(*kind);
-        write_secondary_indexes(
-            tx,
-            events_cf,
-            unspent_cf,
-            credential,
-            oref,
-            settled_at,
-            spent,
-        );
+        write_secondary_indexes(tx, events_cf, unspent_cf, credential, oref, settled_at, spent);
     }
     if !spent {
         write_unit_indexes(tx, cols.unit_unspent_cf, &txo, oref);
