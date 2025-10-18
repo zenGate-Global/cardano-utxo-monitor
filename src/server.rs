@@ -9,7 +9,7 @@ use cml_chain::certs::Credential;
 use cml_chain::transaction::{DatumOption, ScriptRef, TransactionOutput};
 use cml_core::serialization::Serialize;
 use cml_crypto::{Ed25519KeyHash, RawBytesEncoding, ScriptHash, TransactionHash};
-use spectrum_cardano_lib::transaction::TransactionOutputExtension;
+use spectrum_cardano_lib::{transaction::TransactionOutputExtension, OutputRef};
 use std::io;
 use std::net::SocketAddr;
 use utoipa::OpenApi;
@@ -30,14 +30,31 @@ pub enum ApiTxoQuery {
     All(Option<u64>),
     Unspent,
     UnspentByUnit(String),
+    ByOutputRef(ApiOutputRef),
 }
 
-impl From<ApiTxoQuery> for TxoQuery {
-    fn from(value: ApiTxoQuery) -> Self {
+#[derive(Clone, serde::Deserialize, serde::Serialize, Debug, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiOutputRef {
+    #[schema(value_type = String, example = "a1b2c3...")]
+    pub tx_hash: String,
+    pub index: u64,
+}
+
+impl TryFrom<ApiTxoQuery> for TxoQuery {
+    type Error = String;
+
+    fn try_from(value: ApiTxoQuery) -> Result<Self, Self::Error> {
         match value {
-            ApiTxoQuery::All(slot) => TxoQuery::All(slot),
-            ApiTxoQuery::Unspent => TxoQuery::Unspent,
-            ApiTxoQuery::UnspentByUnit(unit) => TxoQuery::UnspentByUnit(unit),
+            ApiTxoQuery::All(slot) => Ok(TxoQuery::All(slot)),
+            ApiTxoQuery::Unspent => Ok(TxoQuery::Unspent),
+            ApiTxoQuery::UnspentByUnit(unit) => Ok(TxoQuery::UnspentByUnit(unit)),
+            ApiTxoQuery::ByOutputRef(out_ref) => {
+                let tx_hash = TransactionHash::from_hex(&out_ref.tx_hash).map_err(|_| {
+                    "Invalid transaction hash format. Expected hex-encoded hash.".to_string()
+                })?;
+                Ok(TxoQuery::ByOutputRef(OutputRef::new(tx_hash, out_ref.index)))
+            }
         }
     }
 }
@@ -227,6 +244,7 @@ pub enum ScriptType {
     components(schemas(
         AddressQueryMode,
         ApiTxoQuery,
+        ApiOutputRef,
         GetTxOsLookup,
         GetTxOsRequest,
         UTxO,
@@ -303,8 +321,8 @@ fn resolve_request_credentials(
         Ok(Some((credential, kind)))
     } else {
         match query {
-            ApiTxoQuery::UnspentByUnit(_) => Ok(None),
-            _ => Err("Either address or hash field is required unless querying unspentByUnit without a credential.".to_string()),
+            ApiTxoQuery::UnspentByUnit(_) | ApiTxoQuery::ByOutputRef(_) => Ok(None),
+            _ => Err("Either address or hash field is required unless querying unspentByUnit without a credential or byOutputRef.".to_string()),
         }
     }
 }
@@ -342,7 +360,10 @@ where
         Err(err) => return HttpResponse::BadRequest().body(err),
     };
 
-    let query: TxoQuery = query_api.into();
+    let query = match TxoQuery::try_from(query_api) {
+        Ok(query) => query,
+        Err(err) => return HttpResponse::BadRequest().body(err),
+    };
 
     let utxos = db.get_utxos(scope, query, offset, limit).await;
     let result = utxos
@@ -413,7 +434,17 @@ where
             &request.query,
         ) {
             Ok(scope) => {
-                let query: TxoQuery = request.query.clone().into();
+                let query = match TxoQuery::try_from(request.query.clone()) {
+                    Ok(query) => query,
+                    Err(err) => {
+                        responses.push(GetTxOsBatchResponseItem {
+                            request,
+                            utxos: Vec::new(),
+                            error: Some(err),
+                        });
+                        continue;
+                    }
+                };
                 let utxos = db.get_utxos(scope, query, offset, limit).await;
                 let utxos = utxos
                     .into_iter()
@@ -584,6 +615,16 @@ mod tests {
             ),
         };
 
+        let sample_lookup_by_output_ref = GetTxOsLookup {
+            address: None,
+            hash: None,
+            mode: AddressQueryMode::ByPaymentCredential,
+            query: ApiTxoQuery::ByOutputRef(ApiOutputRef {
+                tx_hash: "13de3390f33b18faaeeb91eafc839e28c687f47f146e9c68779562a8a5385afc".into(),
+                index: 0,
+            }),
+        };
+
         let sample_request_unspent_by_unit = GetTxOsRequest {
             lookup: sample_lookup_unspent_by_unit.clone(),
             offset: 0,
@@ -595,12 +636,24 @@ mod tests {
         assert!(!json.is_empty());
         println!("{}", json);
 
+        let sample_request_by_output_ref = GetTxOsRequest {
+            lookup: sample_lookup_by_output_ref.clone(),
+            offset: 0,
+            limit: 10,
+            include_cbor_hex: false,
+        };
+
+        let json = serde_json::to_string_pretty(&sample_request_by_output_ref).unwrap();
+        assert!(!json.is_empty());
+        println!("{}", json);
+
         let batch_request = GetTxOsBatchRequest {
             requests: vec![
                 sample_lookup_all.clone(),
                 sample_lookup_unspent.clone(),
                 sample_lookup_unspent_by_unit.clone(),
                 sample_lookup_unspent_by_unit_global.clone(),
+                sample_lookup_by_output_ref.clone(),
             ],
             offset: 0,
             limit: 10,

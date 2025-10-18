@@ -102,6 +102,7 @@ pub enum TxoQuery {
     All(Option<Slot>),
     Unspent,
     UnspentByUnit(String),
+    ByOutputRef(OutputRef),
 }
 
 #[derive(Clone)]
@@ -578,6 +579,31 @@ impl UtxoResolver for RocksDB {
             let snap = db.snapshot();
 
             match (scope, query) {
+                (None, TxoQuery::ByOutputRef(oref)) => {
+                    if offset > 0 {
+                        Vec::new()
+                    } else if let Some((output, settled_at, spent)) = snap
+                        .get_cf(cols.txo_cf, utxo_key(oref))
+                        .unwrap()
+                        .and_then(|bytes| {
+                            rmp_serde::from_slice::<(Vec<u8>, Option<Slot>, bool)>(&bytes).ok()
+                        })
+                        .and_then(|(utxo_bytes, settled_at, spent)| {
+                            TransactionOutput::from_cbor_bytes(&utxo_bytes)
+                                .ok()
+                                .map(|o| (o, settled_at, spent))
+                        })
+                    {
+                        vec![Txo {
+                            oref,
+                            output,
+                            settled_at,
+                            spent,
+                        }]
+                    } else {
+                        Vec::new()
+                    }
+                }
                 (Some((credential, kind)), query_variant) => {
                     let (events_cf, unspent_cf) = cols.index_cfs(kind);
                     let prefix = credential_key_prefix(&credential);
@@ -593,6 +619,44 @@ impl UtxoResolver for RocksDB {
                             TxoQuery::Unspent => (prefix_len, unspent_cf, None, None),
                             TxoQuery::UnspentByUnit(unit) => {
                                 (prefix_len, unspent_cf, None, Some(unit))
+                            }
+                            TxoQuery::ByOutputRef(oref) => {
+                                if offset > 0 {
+                                    return Vec::new();
+                                }
+
+                                if let Some((output, settled_at, spent)) = snap
+                                    .get_cf(cols.txo_cf, utxo_key(oref))
+                                    .unwrap()
+                                    .and_then(|bytes| {
+                                        rmp_serde::from_slice::<(Vec<u8>, Option<Slot>, bool)>(
+                                            &bytes,
+                                        )
+                                        .ok()
+                                    })
+                                    .and_then(|(utxo_bytes, settled_at, spent)| {
+                                        TransactionOutput::from_cbor_bytes(&utxo_bytes)
+                                            .ok()
+                                            .map(|o| (o, settled_at, spent))
+                                    })
+                                {
+                                    let matches_scope = address_credentials(output.address())
+                                        .into_iter()
+                                        .any(|(candidate_kind, candidate)| {
+                                            candidate_kind == kind && candidate == credential
+                                        });
+
+                                    if matches_scope {
+                                        return vec![Txo {
+                                            oref,
+                                            output,
+                                            settled_at,
+                                            spent,
+                                        }];
+                                    }
+                                }
+
+                                return Vec::new();
                             }
                         };
                     let mut txo_iter =
