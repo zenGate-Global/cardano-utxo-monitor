@@ -481,6 +481,12 @@ async fn healthcheck(state_synced: Data<Beacon>) -> impl Responder {
     }
 }
 
+async fn swagger_ui_redirect() -> impl Responder {
+    HttpResponse::Found()
+        .append_header(("Location", "/docs/"))
+        .finish()
+}
+
 fn healthcheck_service() -> actix_web::Resource {
     web::resource("/health").route(web::route().guard(guard::Get()).to(healthcheck))
 }
@@ -508,6 +514,7 @@ where
             .service(healthcheck_service())
             .service(get_utxos_service::<R>())
             .service(get_utxos_batch_service::<R>())
+            .service(web::resource("/docs").route(web::get().to(swagger_ui_redirect)))
             .service(SwaggerUi::new("/docs/{_:.*}").url("/docs/openapi.json", openapi.clone()))
     })
     .bind(bind_addr)?
