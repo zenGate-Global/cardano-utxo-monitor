@@ -97,6 +97,7 @@ UTXO:
 | `{"All": null}` | Get all UTXOs since service start | `{"All": null}` |
 | `{"All": 123456}` | Get all UTXOs from specific slot | `{"All": 123456}` |
 | `{"unspentByUnit": "<policy_id><asset_name>"}` | Get spendable UTXOs that contain a specific asset unit (optionally scoped by address or hash) | `{"unspentByUnit": "<policy_id><asset_name>"}` |
+| `{"byOutputRef": {"txHash": "<tx_hash>", "index": 0}}` | Fetch a specific output by transaction hash and index | `{"byOutputRef": {"txHash": "<tx_hash>", "index": 0}}` |
 
 When `address`/`hash` are omitted in combination with `unspentByUnit`, the monitor scans all stored unspent outputs and returns only those containing the requested asset unit.
 
@@ -121,6 +122,13 @@ Get unspent UTXOs containing a specific unit across all known credentials:
 curl -X POST http://localhost:8080/getUtxos \
   -H "Content-Type: application/json" \
   -d '{"query": {"unspentByUnit": "policyidassetname"}, "offset": 0, "limit": 100}'
+```
+
+Get a specific UTXO by transaction hash and output index:
+```bash
+curl -X POST http://localhost:8080/getUtxos \
+  -H "Content-Type: application/json" \
+  -d '{"query": {"byOutputRef": {"txHash": "<tx_hash>", "index": 0}}, "offset": 0, "limit": 1, "includeCborHex": true}'
 ```
 
 Get transaction history:
