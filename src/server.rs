@@ -38,7 +38,7 @@ pub enum ApiTxoQuery {
 pub struct ApiOutputRef {
     #[schema(value_type = String, example = "a1b2c3...")]
     pub tx_hash: String,
-    pub index: u64,
+    pub output_index: u64,
 }
 
 impl TryFrom<ApiTxoQuery> for TxoQuery {
@@ -53,7 +53,10 @@ impl TryFrom<ApiTxoQuery> for TxoQuery {
                 let tx_hash = TransactionHash::from_hex(&out_ref.tx_hash).map_err(|_| {
                     "Invalid transaction hash format. Expected hex-encoded hash.".to_string()
                 })?;
-                Ok(TxoQuery::ByOutputRef(OutputRef::new(tx_hash, out_ref.index)))
+                Ok(TxoQuery::ByOutputRef(OutputRef::new(
+                    tx_hash,
+                    out_ref.output_index,
+                )))
             }
         }
     }
@@ -621,7 +624,7 @@ mod tests {
             mode: AddressQueryMode::ByPaymentCredential,
             query: ApiTxoQuery::ByOutputRef(ApiOutputRef {
                 tx_hash: "13de3390f33b18faaeeb91eafc839e28c687f47f146e9c68779562a8a5385afc".into(),
-                index: 0,
+                output_index: 0,
             }),
         };
 
