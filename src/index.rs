@@ -423,7 +423,9 @@ fn update_unspent_txo(
 
     for (kind, credential) in &credentials {
         let (events_cf, unspent_cf) = cols.index_cfs(*kind);
-        write_secondary_indexes(tx, events_cf, unspent_cf, credential, oref, settled_at, spent);
+        write_secondary_indexes(
+            tx, events_cf, unspent_cf, credential, oref, settled_at, spent,
+        );
     }
     if !spent {
         write_unit_indexes(tx, cols.unit_unspent_cf, &txo, oref);
