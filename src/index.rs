@@ -344,7 +344,7 @@ fn write_txo(
     settled_at: Option<Slot>,
     spent: bool,
 ) {
-    let bytes = rmp_serde::to_vec(&(txo.to_canonical_cbor_bytes(), settled_at, spent)).unwrap();
+    let bytes = rmp_serde::to_vec(&(txo.to_cbor_bytes(), settled_at, spent)).unwrap();
     tx.put_cf(txo_cf, utxo_key(oref), bytes).unwrap();
 }
 
